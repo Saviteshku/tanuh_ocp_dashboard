@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+.streamlit/
+log/
+*.ipynb
+
+# Data
+data/
+
+# Ignore JSON + parquet everywhere
+*.parquet
