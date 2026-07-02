@@ -15,10 +15,12 @@ Run:
 
 from __future__ import annotations
 import base64
+import hashlib
 import html
-import io
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -114,67 +116,33 @@ def _cols(n_desktop: int, n_tablet: int | None = None, n_phone: int = 1):
 # ════════════════════════════════════════════════════════════════════
 
 # ── Data source ──────────────────────────────────────────────────────
-# Two modes:
-#   • GCS  — set env var OCS_GCS_BUCKET (and optionally OCS_GCS_PREFIX, default
-#            "data"). Used on Cloud Run; the runtime service account is
-#            auto-injected via ADC, so NO key file is needed. Locally, run
-#            `gcloud auth application-default login` then set OCS_GCS_BUCKET.
-#   • Local — leave OCS_GCS_BUCKET unset; reads from LOCAL_DATA_DIR below
-#            (the OneDrive mount). Keeps local/WSL dev working unchanged.
-import os as _os
-import tempfile as _tempfile
-
+# Local filesystem only.
+#   • LOCAL_DATA_DIR — where the parquet and map_data.json live.
+#   • GEOJSON_DATA_DIR — the app's static/ folder, where india_states.geojson
+#            lives (this one ships alongside the app, not with the raw data).
 LOCAL_DATA_DIR = Path(r"/mnt/d/OneDrive/IISC/TANUH/OralCancer_Project/Raw_Data/Dashboard")
 PARQUET_PATH = LOCAL_DATA_DIR / "OCP_COMB_DATA_OVERALL.parquet"
 
-GCS_BUCKET = _os.environ.get("OCS_GCS_BUCKET", "").strip()
-GCS_PREFIX = _os.environ.get("OCS_GCS_PREFIX", "data").strip().rstrip("/")
+# Persistent on-disk cache (survives app/server restarts) so the very first
+# load of the dashboard can serve instantly from this file instead of
+# blocking on a fresh parquet read. Saved alongside app.py.
+DATA_CACHE_PATH = BASE / "ocp_data_cache.pkl"
 
+# Fingerprint of this source file. Stored inside the cache alongside the
+# data itself; whenever app.py changes (this fingerprint changes), the
+# on-disk cache is treated as stale/incompatible and a fresh copy is loaded
+# and written out, instead of risking loading data that no longer matches
+# the current code's expectations
+try:
+    _CODE_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+except NameError:
+    _CODE_VERSION = "unknown"
 
-@st.cache_resource(show_spinner=False)
-def _gcs_client():
-    """Lazily build a GCS client (uses ADC — works on Cloud Run & locally)."""
-    from google.cloud import storage
-    return storage.Client()
+GEOJSON_DATA_DIR = BASE / "static"
 
-
-def _gcs_enabled() -> bool:
-    return bool(GCS_BUCKET)
-
-
-def _gcs_blob_bytes(name: str):
-    """Download one object as bytes; return None if missing or on error."""
-    try:
-        blob = _gcs_client().bucket(GCS_BUCKET).blob(f"{GCS_PREFIX}/{name}")
-        if not blob.exists():
-            return None
-        return blob.download_as_bytes()
-    except Exception as exc:
-        _log.error("GCS download failed for %s: %s", name, exc)
-        return None
-
-
-def _gcs_prefix_to_tempdir(folder: str):
-    """Download every object under <GCS_PREFIX>/<folder>/ into a temp dir
-    (shapefiles need .shp/.shx/.dbf side-by-side). None if empty/errored."""
-    try:
-        bucket = _gcs_client().bucket(GCS_BUCKET)
-        prefix = f"{GCS_PREFIX}/{folder}/"
-        blobs = list(bucket.list_blobs(prefix=prefix))
-        if not blobs:
-            return None
-        tmp = Path(_tempfile.mkdtemp(prefix="ocs_gcs_"))
-        for b in blobs:
-            rel = b.name[len(prefix):]
-            if rel:
-                b.download_to_filename(str(tmp / rel))
-        return tmp
-    except Exception as exc:
-        _log.error("GCS folder download failed for %s/: %s", folder, exc)
-        return None
 
 SITE_ORDER = [
-    "KLE", "AIIMS", "MSMF", "Krishnagiri", "Thanjavur",
+    "KLE", "AIIMS Delhi", "MSMF", "Krishnagiri", "Thanjavur",
     "MPMMCC", "CCHRC", "Borooah", "Goa",
 ]
 
@@ -414,56 +382,221 @@ def _img_to_base64(path_str: str) -> str:
     return f"data:image/{suffix};base64,{base64.b64encode(data).decode()}"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _load_data(path: Path = PARQUET_PATH) -> pd.DataFrame:
-    """Load the combined parquet — from GCS if OCS_GCS_BUCKET is set, else
-    from the local filesystem path."""
-    if _gcs_enabled():
-        raw = _gcs_blob_bytes("OCP_COMB_DATA_OVERALL.parquet")
-        if raw is None:
-            st.error(
-                "Parquet not found in GCS bucket "
-                f"`{GCS_BUCKET}/{GCS_PREFIX}/OCP_COMB_DATA_OVERALL.parquet`."
-            )
-            st.stop()
-        df = pd.read_parquet(io.BytesIO(raw), engine="pyarrow")
-    else:
+class _DataStore:
+    """Shared in-memory holder for the combined dataset with a background
+    refresh thread (stale-while-revalidate), backed by a persistent on-disk
+    pickle cache.
+
+    On the very first dashboard open after a server (re)start, there is
+    nothing in memory yet. Instead of blocking that first request on a
+    fresh parquet read, we serve instantly from `cache_path` (the last
+    known-good snapshot on disk) if it exists, for every tab. A daemon
+    thread then immediately reloads the real parquet source in the
+    background, atomically swaps the fresh DataFrame into memory, and
+    rewrites the on-disk cache — so subsequent opens (and restarts) keep
+    getting faster, always-available data. If no on-disk cache exists yet
+    (very first run ever), the first call falls back to a synchronous
+    parquet read, same as before, and then seeds the cache file.
+
+    The on-disk cache also embeds a `code_version` fingerprint of app.py.
+    If the code has changed since the cache file was written, the old
+    cache is treated as stale/incompatible and discarded automatically —
+    a fresh copy is loaded from the source and the cache file is
+    overwritten with the new version.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        refresh_seconds: int = 3600,
+        cache_path: Path | None = None,
+        code_version: str = "unknown",
+    ):
+        self._path = path
+        self._refresh_seconds = refresh_seconds
+        self._cache_path = cache_path
+        self._code_version = code_version
+        self._lock = threading.Lock()
+        self._df: pd.DataFrame | None = None
+        self._loaded_at: float = 0.0
+        self._thread_started = False
+        self._loaded_from_cache = False
+
+    @staticmethod
+    def _read_from_disk(path: Path) -> pd.DataFrame:
         resolved = Path(path)
         if not resolved.exists():
             _log.error("Data file not found: %s", resolved)
-            st.error(
-                f"Data file not found: **{resolved}**\n\n"
-                "Make sure `OCP_COMB_DATA_OVERALL.parquet` is present in:\n\n"
-                f"`{LOCAL_DATA_DIR}`"
-            )
-            st.stop()
+            raise FileNotFoundError(str(resolved))
+
         df = pd.read_parquet(resolved, engine="pyarrow")
 
-    if "date_of_case_registered" in df.columns:
-        df["date_of_case_registered"] = pd.to_datetime(
-            df["date_of_case_registered"], errors="coerce", dayfirst=True
+        if "date_of_case_registered" in df.columns:
+            df["date_of_case_registered"] = pd.to_datetime(
+                df["date_of_case_registered"], errors="coerce", dayfirst=True
+            )
+
+        _CAT_COLS = (
+            "ai_result", "suspicion", "risk",
+            "gender", "site_id", "provisional_diagnosis", "phase",
         )
+        for _c in _CAT_COLS:
+            if _c in df.columns and df[_c].dtype == object:
+                df[_c] = df[_c].astype("category")
 
-    _CAT_COLS = (
-        "ai_result", "suspicion", "risk",
-        "gender", "site_id", "provisional_diagnosis", "phase",
+        return df
+
+    def _read_from_cache(self) -> pd.DataFrame | None:
+        if not self._cache_path or not self._cache_path.exists():
+            return None
+        try:
+            payload = pd.read_pickle(self._cache_path)
+        except Exception:
+            _log.exception("Failed to read on-disk data cache %s; ignoring it", self._cache_path)
+            return None
+
+        # Backwards-compat: older cache files stored a bare DataFrame with
+        # no version info. Treat those as stale so they get replaced too.
+        if not isinstance(payload, dict) or "df" not in payload:
+            _log.info("On-disk cache %s has no version info; treating as stale", self._cache_path)
+            return None
+
+        if payload.get("code_version") != self._code_version:
+            _log.info(
+                "On-disk cache %s was written by a different code version; discarding it",
+                self._cache_path,
+            )
+            return None
+
+        return payload["df"]
+
+    def _write_to_cache(self, df: pd.DataFrame) -> None:
+        if not self._cache_path:
+            return
+        try:
+            tmp_path = self._cache_path.with_suffix(self._cache_path.suffix + ".tmp")
+            payload = {"code_version": self._code_version, "df": df}
+            pd.to_pickle(payload, tmp_path)
+            tmp_path.replace(self._cache_path)
+        except Exception:
+            _log.exception("Failed to write on-disk data cache %s", self._cache_path)
+
+    def _load_fresh(self) -> pd.DataFrame:
+        """Read the real source from disk and refresh the on-disk cache."""
+        df = self._read_from_disk(self._path)
+        self._write_to_cache(df)
+        return df
+
+    def _refresh_loop(self, initial_delay: float) -> None:
+        first = True
+        while True:
+            time.sleep(initial_delay if first else self._refresh_seconds)
+            first = False
+            try:
+                new_df = self._load_fresh()
+                with self._lock:
+                    self._df = new_df
+                    self._loaded_at = time.time()
+                    self._loaded_from_cache = False
+                _log.info("Background refresh: reloaded %d rows", len(new_df))
+            except Exception:
+                _log.exception("Background data refresh failed; keeping previous data")
+
+    def _ensure_thread(self, initial_delay: float = 0.0) -> None:
+        if self._thread_started:
+            return
+        with self._lock:
+            if not self._thread_started:
+                threading.Thread(
+                    target=self._refresh_loop, args=(initial_delay,), daemon=True
+                ).start()
+                self._thread_started = True
+
+    def get(self) -> pd.DataFrame:
+        """Return a DataFrame instantly wherever possible.
+
+        Order of preference for the very first call in this process:
+          1. Already in memory (fast path for every call after the first).
+          2. Last known-good snapshot on disk (`cache_path`) — instant,
+             served to all tabs, while a background thread kicks off a
+             real refresh from the source right away.
+          3. Nothing cached anywhere yet — synchronous read from the real
+             source (only happens on the very first run ever).
+        """
+        with self._lock:
+            have_data = self._df is not None
+        if not have_data:
+            cached_df = self._read_from_cache()
+            if cached_df is not None:
+                with self._lock:
+                    if self._df is None:
+                        self._df = cached_df
+                        self._loaded_at = time.time()
+                        self._loaded_from_cache = True
+                # Kick off a real refresh from the source right away in the
+                # background, instead of waiting a full refresh cycle.
+                self._ensure_thread(initial_delay=0.0)
+                with self._lock:
+                    return self._df
+            else:
+                df = self._read_from_disk(self._path)
+                self._write_to_cache(df)
+                with self._lock:
+                    if self._df is None:
+                        self._df = df
+                        self._loaded_at = time.time()
+                        self._loaded_from_cache = False
+        self._ensure_thread(initial_delay=self._refresh_seconds)
+        with self._lock:
+            return self._df
+
+    def force_refresh(self) -> pd.DataFrame:
+        """Synchronously reload from disk right now (used by the manual
+        'Refresh Data' button) and update both the in-memory and on-disk
+        cache."""
+        df = self._load_fresh()
+        with self._lock:
+            self._df = df
+            self._loaded_at = time.time()
+            self._loaded_from_cache = False
+        self._ensure_thread(initial_delay=self._refresh_seconds)
+        return df
+
+
+@st.cache_resource(show_spinner=False)
+def _get_data_store() -> _DataStore:
+    # st.cache_resource makes this a single shared singleton across all
+    # sessions in the server process, which is what lets the background
+    # refresh thread serve every tab/session from the same in-memory cache.
+    return _DataStore(
+        PARQUET_PATH,
+        refresh_seconds=3600,
+        cache_path=DATA_CACHE_PATH,
+        code_version=_CODE_VERSION,
     )
-    for _c in _CAT_COLS:
-        if _c in df.columns and df[_c].dtype == object:
-            df[_c] = df[_c].astype("category")
 
-    return df
+
+def _load_data(path: Path = PARQUET_PATH) -> pd.DataFrame:
+    """Return the combined dataset instantly from the shared cache.
+
+    Only the very first call across the whole server process blocks on a
+    disk read; after that, every dashboard open (all tabs) is served from
+    memory while a background thread keeps the data fresh.
+    """
+    try:
+        return _get_data_store().get()
+    except FileNotFoundError as exc:
+        st.error(
+            f"Data file not found: **{exc}**\n\n"
+            "Make sure `OCP_COMB_DATA_OVERALL.parquet` is present in:\n\n"
+            f"`{LOCAL_DATA_DIR}`"
+        )
+        st.stop()
 
 
 @st.cache_data(ttl=86400, max_entries=1, show_spinner=False)
 def _load_map_data() -> dict:
-    """Load map_data.json — from GCS if configured, else local."""
-    if _gcs_enabled():
-        raw = _gcs_blob_bytes("map_data.json")
-        if raw is None:
-            _log.warning("map_data.json not found in GCS — returning empty dict")
-            return {}
-        return json.loads(raw)
+    """Load map_data.json from the local filesystem."""
     map_path = LOCAL_DATA_DIR / "map_data.json"
     if not map_path.exists():
         _log.warning("map_data.json not found at %s — returning empty dict", map_path)
@@ -476,12 +609,10 @@ def _load_map_data() -> dict:
 def _load_india_geojson():
     """Return (geojson_dict, state_property_name) or (None, None).
 
-    Lookup priority:
-      1. LOCAL_DATA_DIR/india_states.geojson  — compact GeoJSON (preferred)
-      2. LOCAL_DATA_DIR/India_State_Country/India_State_Boundary.shp — shapefile
+    Source: GEOJSON_DATA_DIR/india_states.geojson (the app's static/
+    folder). No shapefile fallback; if the GeoJSON is missing or
+    invalid, the map is skipped and a status message is shown instead.
     """
-    import json as _json
-
     _PROP_CANDS = ("State_Name", "NAME_1", "ST_NM", "name", "NAME", "GEO_ID", "STNAME", "state")
 
     def _detect_prop(gj: dict) -> str:
@@ -491,66 +622,17 @@ def _load_india_geojson():
                 return p
         return next(iter(props), "NAME_1")
 
-    # ── GCS mode ────────────────────────────────────────────────────
-    if _gcs_enabled():
-        raw = _gcs_blob_bytes("india_states.geojson")
-        if raw is not None:
-            try:
-                gj = _json.loads(raw)
-                return gj, _detect_prop(gj)
-            except Exception as exc:
-                _log.warning("Failed to parse india_states.geojson from GCS: %s", exc)
-        # shapefile fallback — download the whole folder
-        tmp = _gcs_prefix_to_tempdir("India_State_Country")
-        if tmp is not None:
-            shp = tmp / "India_State_Boundary.shp"
-            if shp.exists():
-                try:
-                    import geopandas as gpd
-                    gdf = gpd.read_file(str(shp))
-                    if gdf.crs is not None:
-                        if gdf.crs.to_epsg() != 4326:
-                            gdf = gdf.to_crs(epsg=4326)
-                    else:
-                        gdf = gdf.set_crs(epsg=3857, allow_override=True).to_crs(epsg=4326)
-                    gj = _json.loads(gdf.to_json())
-                    return gj, _detect_prop(gj)
-                except Exception as exc:
-                    _log.warning("Shapefile load failed (GCS): %s", exc)
-        _log.error("No GeoJSON or shapefile found in GCS. Map will not render.")
+    gjp = GEOJSON_DATA_DIR / "india_states.geojson"
+    if not gjp.exists():
+        _log.error("india_states.geojson not found at %s. Map will not render.", gjp)
         return None, None
-
-    # ── Local mode ──────────────────────────────────────────────────
-    # 1. Compact local GeoJSON (fastest — preferred)
-    gjp = LOCAL_DATA_DIR / "india_states.geojson"
-    if gjp.exists():
-        try:
-            with open(gjp, encoding="utf-8") as f:
-                gj = _json.load(f)
-            return gj, _detect_prop(gj)
-        except Exception as exc:
-            _log.warning("Failed to parse india_states.geojson: %s", exc)
-
-    # 2. Local shapefile fallback
-    shp = LOCAL_DATA_DIR / "India_State_Country" / "India_State_Boundary.shp"
-    if shp.exists():
-        try:
-            import geopandas as gpd
-            gdf = gpd.read_file(str(shp))
-            if gdf.crs is not None:
-                if gdf.crs.to_epsg() != 4326:
-                    gdf = gdf.to_crs(epsg=4326)
-            else:
-                gdf = gdf.set_crs(epsg=3857, allow_override=True).to_crs(epsg=4326)
-            gj = _json.loads(gdf.to_json())
-            return gj, _detect_prop(gj)
-        except Exception as exc:
-            _log.warning("Shapefile load failed: %s", exc)
-
-    _log.error(
-        "No GeoJSON or shapefile found in %s. Map will not render.", LOCAL_DATA_DIR
-    )
-    return None, None
+    try:
+        with open(gjp, encoding="utf-8") as f:
+            gj = json.load(f)
+        return gj, _detect_prop(gj)
+    except Exception as exc:
+        _log.error("Failed to parse india_states.geojson: %s", exc)
+        return None, None
 
 
 
@@ -1544,7 +1626,7 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
         "Kohima":                "middle right",
         "Goa":                   "middle right",
         "Thanjavur":             "middle right",
-        "AIIMS":                 "top left",
+        "AIIMS Delhi":           "top left",
         "Varanasi":              "middle right",
         "Cachar & Guwahati":     "middle right",
         "Bangalore":             "middle right",
@@ -1724,8 +1806,10 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         )
 
     with col_r:
-        susp_rate = round(total_susp / reviewed_total * 100) if reviewed_total else 0
-        high_pct  = round(high_total / reviewed_total * 100, 1) if reviewed_total else 0
+        # % is of total screened (total_cum) — matches the Site-wise
+        # Summary table below, not the reviewed-only subset.
+        susp_rate = round(total_susp / total_cum * 100, 1) if total_cum else 0
+        high_pct  = round(high_total / total_cum * 100, 1) if total_cum else 0
 
         st.markdown(
             f'<div class="ocp-card ocp-card-amb ocp-card-dualstat" style="padding:10px 24px 8px;">'
@@ -1796,6 +1880,83 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 },
                 key="ov_india_map",
             )
+        else:
+            st.warning(
+                "🗺️ Map unavailable — `india_states.geojson` could not be found or "
+                "read. Check that the file is present in the configured data source."
+            )
+
+    # ── Site-wise Summary Table ───────────────────────────────────────
+    # Site | Screened | Suspicious | High risk — % taken row-wise against
+    # that site's total screened (same colours as the summary cards
+    # above: green for screened, amber for suspicious, red for high risk).
+    if "site_id" in df.columns:
+        id_col = _id_col(df)
+        reviewed_mask, suspicious_mask, _, _ = _choose_status_masks(df, phase="phase1")
+        high_mask = (
+            suspicious_mask & _is_high_risk(df["risk"])
+            if "risk" in df.columns
+            else pd.Series(False, index=df.index)
+        )
+
+        site_key = df["site_id"].astype(str)
+        screened_by_site   = df.groupby(site_key)[id_col].nunique()
+        suspicious_by_site = suspicious_mask.groupby(site_key).sum()
+        high_by_site        = high_mask.groupby(site_key).sum()
+
+        sites_present = (
+            [s for s in SITE_ORDER if s in screened_by_site.index]
+            + sorted(set(screened_by_site.index) - set(SITE_ORDER))
+        )
+
+        if sites_present:
+            rows_html = []
+            for site in sites_present:
+                screened = int(screened_by_site.get(site, 0))
+                susp     = int(suspicious_by_site.get(site, 0))
+                high     = int(high_by_site.get(site, 0))
+                susp_pct = round(susp / screened * 100, 1) if screened else 0.0
+                high_pct = round(high / screened * 100, 1) if screened else 0.0
+                rows_html.append(
+                    "<tr>"
+                    f"<td style='padding:9px 14px;text-align:left;font-weight:600;"
+                    f"color:#333;border-top:1px solid #eee;'>{html.escape(site)}</td>"
+                    f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
+                    f"color:#228B22;border-top:1px solid #eee;'>{screened:,}</td>"
+                    f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
+                    f"color:#F4A900;border-top:1px solid #eee;'>{susp:,} ({susp_pct}%)</td>"
+                    f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
+                    f"color:#D94040;border-top:1px solid #eee;'>{high:,} ({high_pct}%)</td>"
+                    "</tr>"
+                )
+
+            table_html = (
+                "<div style='overflow-x:auto;'>"
+                "<table style='width:100%;border-collapse:collapse;background:#fff;"
+                "border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,.07);'>"
+                "<thead><tr style='background:#fafafa;'>"
+                "<th style='padding:10px 14px;text-align:left;font-size:14px;"
+                "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+                "color:#555;'>Sites</th>"
+                "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+                "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+                "color:#228B22;'>Screened</th>"
+                "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+                "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+                "color:#F4A900;'>Suspicious</th>"
+                "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+                "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+                "color:#D94040;'>High Risk</th>"
+                "</tr></thead><tbody>" + "".join(rows_html) + "</tbody></table></div>"
+            )
+
+            st.markdown(
+                "<hr style='border:none;border-top:1px solid #eee;margin:18px 0 10px;'>"
+                "<div style='font-weight:700;font-size:25px;color:#333;"
+                "margin-bottom:8px;'>🏥 Site-wise Summary</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(table_html, unsafe_allow_html=True)
 
 
 @st.fragment
@@ -1842,8 +2003,10 @@ def _tab_phase1(df: pd.DataFrame) -> None:
         )
 
     with col_r:
-        susp_rate = round(total_susp / reviewed_total * 100) if reviewed_total else 0
-        high_pct  = round(high_total / reviewed_total * 100, 1) if reviewed_total else 0
+        # % is of total screened (total_cum) — matches the Overall tab's
+        # Site-wise Summary table, not the reviewed-only subset.
+        susp_rate = round(total_susp / total_cum * 100, 1) if total_cum else 0
+        high_pct  = round(high_total / total_cum * 100, 1) if total_cum else 0
 
         st.markdown(
             f'<div class="ocp-card ocp-card-amb ocp-card-dualstat" style="padding:10px 24px 8px;">'
@@ -1863,35 +2026,6 @@ def _tab_phase1(df: pd.DataFrame) -> None:
         )
 
 
-@st.cache_data(max_entries=4, ttl=3600, show_spinner=False)
-def _compute_highrisk_breakdown(df: pd.DataFrame) -> tuple[int, int]:
-    """Return (high_ai_path, high_tele_path).
-
-    high_ai_path  = rows where AI result is suspicious AND risk is high.
-    high_tele_path = rows where tele-reviewed, specialist suspicious, AND risk is high.
-    """
-    ai_col = _ai_result_col(df)
-    if ai_col is None or "risk" not in df.columns:
-        return 0, 0
-
-    ai_s_mask = _present_mask(df[ai_col]) & _norm(df[ai_col]).eq("suspicious")
-    tr_mask   = (
-        _present_mask(df["provisional_diagnosis"])
-        if "provisional_diagnosis" in df.columns
-        else pd.Series(False, index=df.index)
-    )
-    sc_mask   = (
-        _norm(df["suspicion"]).eq("suspicious")
-        if "suspicion" in df.columns
-        else pd.Series(False, index=df.index)
-    )
-    hi_mask = _is_high_risk(df["risk"])
-    return (
-        int((ai_s_mask & hi_mask).sum()),
-        int((tr_mask   & sc_mask & hi_mask).sum()),
-    )
-
-
 @st.fragment
 def _tab_phase2(df: pd.DataFrame) -> None:
     if df.empty:
@@ -1909,7 +2043,7 @@ def _tab_phase2(df: pd.DataFrame) -> None:
     last_lbl      = last_row["month_lbl"]
     total_screened = int(mon["total"].sum())
     ai_susp_total  = int(mon["ai_suspicious"].sum())
-    ai_susp_rate   = round(ai_susp_total / total_screened * 100) if total_screened else 0
+    ai_susp_rate   = round(ai_susp_total / total_screened * 100, 1) if total_screened else 0
 
     st.markdown("<div style='height:4px;'></div>", unsafe_allow_html=True)
 
@@ -1946,12 +2080,14 @@ def _tab_phase2(df: pd.DataFrame) -> None:
     else:
         ai_s_tot  = 0
         ai_total  = 0
-    ai_susp_rate_r = round(ai_s_tot / ai_total * 100) if ai_total else 0
+    # % is of total screened (total_screened) — matches the Overall tab's
+    # Site-wise Summary table, not the AI-reviewed-only subset (ai_total).
+    ai_susp_rate_r = round(ai_s_tot / total_screened * 100, 1) if total_screened else 0
 
     # Current month suspicious from mon (already computed per month)
     last_ai_susp    = int(mon.iloc[-1]["ai_suspicious"]) if "ai_suspicious" in mon.columns else 0
     last_n_screened = int(mon.iloc[-1]["total"])
-    last_susp_rate  = round(last_ai_susp / last_n_screened * 100) if last_n_screened else 0
+    last_susp_rate  = round(last_ai_susp / last_n_screened * 100, 1) if last_n_screened else 0
 
     with col_r:
         _animated_metric_card(
@@ -2171,7 +2307,8 @@ def main() -> None:
         site_sel = st.sidebar.selectbox("🏥 Site", ["All"] + live_sites, key=f"st_{_f}")
 
     st.sidebar.markdown("---")
-    if st.sidebar.button("🔃 Refresh Data", width="stretch", help="Clear cache and reload data"):
+    if st.sidebar.button("🔃 Refresh Data", width="stretch", help="Reload data now"):
+        _get_data_store().force_refresh()
         st.cache_data.clear()
         st.rerun()
 

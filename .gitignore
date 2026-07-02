@@ -9,3 +9,4 @@ data/
 
 # Ignore JSON + parquet everywhere
 *.parquet
+*.pkl
