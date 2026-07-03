@@ -1388,7 +1388,6 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
 # ════════════════════════════════════════════════════════════════════
 # 7.  UI COMPONENT HELPERS
 # ════════════════════════════════════════════════════════════════════
-
 def _duration_text(df: pd.DataFrame) -> str:
     """Return a formatted duration string like '(Jun 2023 – Dec 2024 · 18 months)'."""
     if "date_of_case_registered" not in df.columns:
@@ -1397,10 +1396,9 @@ def _duration_text(df: pd.DataFrame) -> str:
     if dates.empty:
         return ""
     start, end = dates.min(), dates.max()
-    months = (end.year - start.year) * 12 + (end.month - start.month)
+    months = (end.year - start.year) * 12 + (end.month - start.month) + 1
     month_label = "month" if months == 1 else "months"
     return f"({start.strftime('%b %Y')} – {end.strftime('%b %Y')} · {months} {month_label})"
-
 
 def _animated_metric_card(
     value: int,
