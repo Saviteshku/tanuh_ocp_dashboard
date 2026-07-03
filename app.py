@@ -19,6 +19,7 @@ import hashlib
 import html
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -117,10 +118,18 @@ def _cols(n_desktop: int, n_tablet: int | None = None, n_phone: int = 1):
 
 # ── Data source ──────────────────────────────────────────────────────
 # Local filesystem only.
-#   • LOCAL_DATA_DIR — where the parquet and map_data.json live.
+#   • LOCAL_DATA_DIR — where the parquet and map_data.json live. Defaults to
+#            the original dev machine path; deployed environments (e.g. the
+#            GKE pod, which has an init container stage the data into /data)
+#            set OCP_DATA_DIR to override it.
 #   • GEOJSON_DATA_DIR — the app's static/ folder, where india_states.geojson
 #            lives (this one ships alongside the app, not with the raw data).
-LOCAL_DATA_DIR = Path(r"/mnt/d/OneDrive/IISC/TANUH/OralCancer_Project/Raw_Data/Dashboard")
+LOCAL_DATA_DIR = Path(
+    os.environ.get(
+        "OCP_DATA_DIR",
+        r"/mnt/d/OneDrive/IISC/TANUH/OralCancer_Project/Raw_Data/Dashboard",
+    )
+)
 PARQUET_PATH = LOCAL_DATA_DIR / "OCP_COMB_DATA_OVERALL.parquet"
 
 # Persistent on-disk cache (survives app/server restarts) so the very first
