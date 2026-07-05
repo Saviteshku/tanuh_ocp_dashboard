@@ -857,7 +857,15 @@ def monthly_stats(
         mon["cumulative"]   = mon["total"].cumsum()
         denom               = mon["reviewed_total"].replace(0, np.nan)
         mon["susp_pct"]     = (mon["suspicious"] / denom * 100).round(1).fillna(0)
-        mon["non_susp_pct"] = (100 - mon["susp_pct"]).round(1)
+        # When nobody has been reviewed yet this month (reviewed_total == 0,
+        # e.g. provisional_diagnosis is still "-"/blank for all cases), there
+        # is no "non-suspicious" data either — it must read 0%, not 100%.
+        # Without this guard, 100 - susp_pct(=0) incorrectly evaluates to 100.
+        mon["non_susp_pct"] = np.where(
+            mon["reviewed_total"] > 0,
+            (100 - mon["susp_pct"]).round(1),
+            0.0,
+        )
         mon["month_lbl"]    = mon["ym"].dt.start_time.dt.strftime("%b %Y")
         return mon
 
