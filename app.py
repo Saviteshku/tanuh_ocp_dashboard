@@ -1919,6 +1919,13 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         suspicious_by_site = suspicious_mask.groupby(site_key).sum()
         high_by_site        = high_mask.groupby(site_key).sum()
 
+        if "date_of_case_registered" in df.columns:
+            min_date_by_site = df.groupby(site_key)["date_of_case_registered"].min()
+            max_date_by_site = df.groupby(site_key)["date_of_case_registered"].max()
+        else:
+            min_date_by_site = pd.Series(dtype="datetime64[ns]")
+            max_date_by_site = pd.Series(dtype="datetime64[ns]")
+
         sites_present = (
             [s for s in SITE_ORDER if s in screened_by_site.index]
             + sorted(set(screened_by_site.index) - set(SITE_ORDER))
@@ -1932,10 +1939,22 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 high     = int(high_by_site.get(site, 0))
                 susp_pct = round(susp / screened * 100, 1) if screened else 0.0
                 high_pct = round(high / screened * 100, 1) if screened else 0.0
+
+                min_dt = min_date_by_site.get(site)
+                max_dt = max_date_by_site.get(site)
+                if pd.notna(min_dt) and pd.notna(max_dt):
+                    duration_str = (
+                        f"{min_dt.strftime('%d-%b-%Y')} to {max_dt.strftime('%d-%b-%Y')}"
+                    )
+                else:
+                    duration_str = "—"
+
                 rows_html.append(
                     "<tr>"
                     f"<td style='padding:9px 14px;text-align:left;font-weight:600;"
                     f"color:#333;border-top:1px solid #eee;'>{html.escape(site)}</td>"
+                    f"<td style='padding:9px 14px;text-align:center;font-weight:600;"
+                    f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(duration_str)}</td>"
                     f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
                     f"color:#228B22;border-top:1px solid #eee;'>{screened:,}</td>"
                     f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
@@ -1953,6 +1972,9 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 "<th style='padding:10px 14px;text-align:left;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
                 "color:#555;'>Sites</th>"
+                "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+                "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+                "color:#555;'>Duration</th>"
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
                 "color:#228B22;'>Screened</th>"
