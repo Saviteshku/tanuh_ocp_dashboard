@@ -758,11 +758,16 @@ def _date_window_mask(
         return pd.Series(True, index=df.index)
 
     if window == "Last 6 months":
-        start = _months_back(pd.Timestamp(anchor), 6)
-        return mask & (dates >= start) & (dates <= anchor)
+        anchor = pd.Timestamp(anchor)
+        start = (anchor.to_period("M") - 5).start_time
+        end = anchor
+        return mask & (dates >= start) & (dates <= end)
+
     if window == "Last 3 months":
-        start = _months_back(pd.Timestamp(anchor), 3)
-        return mask & (dates >= start) & (dates <= anchor)
+        anchor = pd.Timestamp(anchor)
+        start = (anchor.to_period("M") - 2).start_time
+        end = anchor
+        return mask & (dates >= start) & (dates <= end)
     if window == "Custom range":
         if custom_start is None or custom_end is None:
             return pd.Series(True, index=df.index)
