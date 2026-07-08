@@ -1701,6 +1701,21 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
             name = s.get("name", "")
             tpos = _TEXT_POS.get(name, "middle right")
 
+            # Hover text: site name, then any *ongoing* subsites listed
+            # indented on their own line below it (halted/other-status
+            # subsites are left out of the hover entirely).
+            ongoing_subs = [
+                sub.get("name", "")
+                for sub in s.get("subsites", [])
+                if sub.get("status") == "ongoing"
+            ]
+            hover_lines = [f"<b>{html.escape(name)}</b>"]
+            hover_lines += [
+                f"&nbsp;&nbsp;&nbsp;&nbsp;{html.escape(sub_name)}"
+                for sub_name in ongoing_subs
+            ]
+            hover_text = "<br>".join(hover_lines)
+
             fig.add_trace(go.Scattergeo(
                 lat=[s["coordinates"][0]],
                 lon=[s["coordinates"][1]],
@@ -1715,7 +1730,8 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
                 textposition=tpos,
                 textfont=dict(size=14, color=color),
                 name=label if i == 0 else "",
-                hovertemplate="<b>%{text}</b><extra></extra>",
+                customdata=[hover_text],
+                hovertemplate="%{customdata}<extra></extra>",
                 showlegend=(i == 0),
             ))
 
