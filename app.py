@@ -964,6 +964,38 @@ def plot_height_from_width(width: int) -> int:
         return 400
 
 
+# Standard browser rendering is ~96 CSS px/inch. Plotly's exported-image
+# "scale" multiplies the on-screen pixel dimensions, so scale = target_dpi
+# / 96 gives an export at roughly that effective print DPI. 400 / 96 ≈
+# 4.17; export width/height are set generously large on top of that so
+# the download is a big, print-quality image rather than a small chart
+# blown up past its native resolution.
+_HIRES_SCALE = round(400 / 96, 2)
+
+
+def _hires_plot_config(filename: str, width: int = 1800, height: int = 1100, extra: dict | None = None) -> dict:
+    """Plotly config that shows just the camera/download modebar button and
+    exports a large, 400-DPI-equivalent PNG when clicked."""
+    cfg = {
+        "displayModeBar": True,
+        "displaylogo": False,
+        "modeBarButtonsToRemove": [
+            "zoom2d", "pan2d", "select2d", "lasso2d",
+            "zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d",
+        ],
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": filename,
+            "width": width,
+            "height": height,
+            "scale": _HIRES_SCALE,
+        },
+    }
+    if extra:
+        cfg.update(extra)
+    return cfg
+
+
 _BASE_LAYOUT = dict(
     plot_bgcolor="white",
     paper_bgcolor="white",
@@ -1392,7 +1424,7 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
 
     fig_height = plot_height_from_width(sw)
     top_mg     = 28
-    bot_mg     = max(90, int(fig_height * 0.11))
+    bot_mg     = max(130, int(fig_height * 0.11))
 
     fig = go.Figure(go.Sankey(
         arrangement="fixed",
@@ -1668,8 +1700,8 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
     map_sites = map_data.get("map_sites", [])
 
     _PIN_COLORS = {
-        "district_sentinel": {"ongoing": "#C0392B", "future": "#C0392B"},
-        "sentinel":          {"ongoing": "#2980B9", "future": "#2980B9"},
+        "district_sentinel": {"ongoing": "#C0392B", "upcoming": "#C0392B"},
+        "sentinel":          {"ongoing": "#2980B9", "upcoming": "#2980B9"},
     }
     _PIN_LABELS = {
         "district_sentinel": "District Level Deployment and Sentinel Site",
@@ -1701,18 +1733,19 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
             name = s.get("name", "")
             tpos = _TEXT_POS.get(name, "middle right")
 
-            # Hover text: site name, then any *ongoing* subsites listed
-            # indented on their own line below it (halted/other-status
-            # subsites are left out of the hover entirely).
-            ongoing_subs = [
+            # Hover text: site name, then any *ongoing* or *upcoming*
+            # subsites listed indented on their own line below it
+            # (halted/other-status subsites are left out of the hover
+            # entirely).
+            visible_subs = [
                 sub.get("name", "")
                 for sub in s.get("subsites", [])
-                if sub.get("status") == "ongoing"
+                if sub.get("status") in ("ongoing", "upcoming")
             ]
             hover_lines = [f"<b>{html.escape(name)}</b>"]
             hover_lines += [
                 f"&nbsp;&nbsp;&nbsp;&nbsp;{html.escape(sub_name)}"
-                for sub_name in ongoing_subs
+                for sub_name in visible_subs
             ]
             hover_text = "<br>".join(hover_lines)
 
@@ -1875,7 +1908,7 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         st.plotly_chart(
             _fig_registrations(mon),
             width="stretch",
-            config={"displayModeBar": False},
+            config=_hires_plot_config("overall_registrations"),
             key="ov_reg",
         )
 
@@ -1898,7 +1931,7 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         st.plotly_chart(
             _fig_status(mon, "Suspicious", "Suspicious"),
             width="stretch",
-            config={"displayModeBar": False},
+            config=_hires_plot_config("overall_suspicious_status"),
             key="ov_susp",
         )
 
@@ -1945,9 +1978,16 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                     "displayModeBar": True,
                     "displaylogo": False,
                     # Geo traces only expose zoomInGeo / zoomOutGeo / resetGeo /
-                    # hoverClosestGeo on the mode bar — keep just the +/- zoom
-                    # and reset, drop the hover-toggle and image-export icons.
-                    "modeBarButtonsToRemove": ["hoverClosestGeo", "toImage"],
+                    # hoverClosestGeo on the mode bar — keep +/- zoom, reset,
+                    # and the download button; drop just the hover-toggle icon.
+                    "modeBarButtonsToRemove": ["hoverClosestGeo"],
+                    "toImageButtonOptions": {
+                        "format": "png",
+                        "filename": "india_coverage_map",
+                        "width": 1650,
+                        "height": 950,
+                        "scale": _HIRES_SCALE,
+                    },
                     "scrollZoom": False,
                     "responsive": True,
                     "doubleClick": "reset",
@@ -1978,6 +2018,13 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         suspicious_by_site = suspicious_mask.groupby(site_key).sum()
         high_by_site        = high_mask.groupby(site_key).sum()
 
+        if "states" in df.columns:
+            state_by_site = df.groupby(site_key)["states"].agg(
+                lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
+            )
+        else:
+            state_by_site = pd.Series(dtype=object)
+
         if "date_of_case_registered" in df.columns:
             min_date_by_site = df.groupby(site_key)["date_of_case_registered"].min()
             max_date_by_site = df.groupby(site_key)["date_of_case_registered"].max()
@@ -1998,6 +2045,7 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 high     = int(high_by_site.get(site, 0))
                 susp_pct = round(susp / screened * 100, 1) if screened else 0.0
                 high_pct = round(high / screened * 100, 1) if screened else 0.0
+                state_str = str(state_by_site.get(site, "") or "—")
 
                 min_dt = min_date_by_site.get(site)
                 max_dt = max_date_by_site.get(site)
@@ -2012,6 +2060,8 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                     "<tr>"
                     f"<td style='padding:9px 14px;text-align:left;font-weight:600;"
                     f"color:#333;border-top:1px solid #eee;'>{html.escape(site)}</td>"
+                    f"<td style='padding:9px 14px;text-align:center;font-weight:600;"
+                    f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(state_str)}</td>"
                     f"<td style='padding:9px 14px;text-align:center;font-weight:600;"
                     f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(duration_str)}</td>"
                     f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
@@ -2031,6 +2081,9 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 "<th style='padding:10px 14px;text-align:left;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
                 "color:#555;'>Sites</th>"
+                "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+                "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+                "color:#555;'>State</th>"
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
                 "color:#555;'>Duration</th>"
@@ -2094,7 +2147,7 @@ def _tab_phase1(df: pd.DataFrame) -> None:
         st.plotly_chart(
             _fig_registrations(mon),
             width="stretch",
-            config={"displayModeBar": False},
+            config=_hires_plot_config("phase1_registrations"),
             key="p1_reg",
         )
 
@@ -2117,7 +2170,7 @@ def _tab_phase1(df: pd.DataFrame) -> None:
         st.plotly_chart(
             _fig_status(mon, "Suspicious", "Suspicious"),
             width="stretch",
-            config={"displayModeBar": False},
+            config=_hires_plot_config("phase1_suspicious_status"),
             key="p1_susp",
         )
 
@@ -2161,7 +2214,7 @@ def _tab_phase2(df: pd.DataFrame) -> None:
         st.plotly_chart(
             _fig_registrations(mon),
             width="stretch",
-            config={"displayModeBar": False},
+            config=_hires_plot_config("phase2_registrations"),
             key="p2_reg",
         )
 
@@ -2197,7 +2250,7 @@ def _tab_phase2(df: pd.DataFrame) -> None:
         st.plotly_chart(
             _fig_sankey_phase2(df, screen_width),
             width="stretch",
-            config={"displayModeBar": False},
+            config=_hires_plot_config("phase2_ai_pathway_sankey", width=1500, height=850),
             key="p2_sankey",
         )
 
@@ -2304,7 +2357,7 @@ def main() -> None:
                     comb_width = 220 if IS_TABLET else 300
                     st.image(str(logo_comb), width=comb_width)
             else:
-                st.image(str(logo_comb), width=160)
+                st.image(str(logo_comb), width=250)
 
     # Right-side buttons — stack full-width below the title on phone,
     # side-by-side column on tablet/desktop.
