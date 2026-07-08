@@ -1720,7 +1720,7 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
         "Delhi":                 "top left",
         "Varanasi":              "middle right",
         "Silchar":               "middle right",
-        "Ghuwahati":             "middle right",
+        "Guwahati":              "top left",
         "Bangalore":             "middle right",
     }
 
