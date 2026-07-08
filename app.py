@@ -2236,18 +2236,21 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
 
-        # Combined logo inline — hidden on phone (not enough room next to
-        # the title; it still appears on tablet/desktop as before).
-        if c3 is not None:
-            with c3:
-                logo_comb = BASE / "static" / "logo_comb.png"
-                if logo_comb.exists():
+        # Combined logo — inline next to the title on tablet/desktop;
+        # own row below the title on phone (not enough horizontal room
+        # next to the title at that width).
+        logo_comb = BASE / "static" / "logo_comb.png"
+        if logo_comb.exists():
+            if c3 is not None:
+                with c3:
                     st.markdown(
                         "<div style='margin-top:-20px;'></div>",
                         unsafe_allow_html=True
                     )
                     comb_width = 220 if IS_TABLET else 300
                     st.image(str(logo_comb), width=comb_width)
+            else:
+                st.image(str(logo_comb), width=250)
 
     # Right-side buttons — stack full-width below the title on phone,
     # side-by-side column on tablet/desktop.
