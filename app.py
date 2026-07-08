@@ -44,11 +44,49 @@ except NameError:
 
 logo_path = BASE / "static" / "logo.png"
 
+# ── Force light theme regardless of OS/browser dark-mode setting ────────
+# Streamlit's theme is controlled by .streamlit/config.toml, read once at
+# server startup — it can't be changed via st.set_page_config or at runtime.
+# Write it here (once) so the *next* server start picks up "light" instead
+# of following the system preference. Requires an app restart to take
+# effect; the CSS override below forces light colors immediately in the
+# meantime, independent of that restart.
+_config_dir = BASE / ".streamlit"
+_config_path = _config_dir / "config.toml"
+_theme_block = (
+    "[theme]\n"
+    'base = "light"\n'
+    'primaryColor = "#0771eb"\n'
+    'backgroundColor = "#ffffff"\n'
+    'secondaryBackgroundColor = "#f5f5f5"\n'
+    'textColor = "#000000"\n'
+)
+try:
+    if not _config_path.exists():
+        _config_dir.mkdir(parents=True, exist_ok=True)
+        _config_path.write_text(_theme_block)
+except OSError:
+    pass  # e.g. read-only filesystem — config.toml must be added manually
+
 st.set_page_config(
     page_title="Aarogya Aarohan | TANUH OCP",
     page_icon=str(logo_path.resolve()) if logo_path.exists() else "🏥",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# Immediate CSS override — forces light colors in the current session even
+# before a restart applies config.toml, and even if the OS/browser is set
+# to dark mode.
+st.markdown(
+    """
+    <style>
+    :root, .stApp {
+        color-scheme: light !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 # ── Mobile viewport fix ──────────────────────────────────────────────
@@ -902,18 +940,18 @@ def monthly_stats(
 
 def map_height_from_width(width:int)->int:
     if width >= 2400:
-        return 1100
+        return 1150
     elif width >= 1800:
-        return 900
+        return 1000
     elif width >= 1400:
-        return 780
+        return 800
     elif width >= 1000:
-        return 650
+        return 750
     elif width >= 640:
         return 500
     # Phone: map + legend share a stacked layout, so neither needs the
     # tall fixed height used on wider screens.
-    return 360
+    return 500
 
 def plot_height_from_width(width: int) -> int:
     if width >= 2200:
@@ -2250,7 +2288,7 @@ def main() -> None:
                     comb_width = 220 if IS_TABLET else 300
                     st.image(str(logo_comb), width=comb_width)
             else:
-                st.image(str(logo_comb), width=250)
+                st.image(str(logo_comb), width=160)
 
     # Right-side buttons — stack full-width below the title on phone,
     # side-by-side column on tablet/desktop.
