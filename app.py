@@ -190,7 +190,7 @@ GEOJSON_DATA_DIR = BASE / "static"
 
 SITE_ORDER = [
     "KLE", "AIIMS Delhi", "MSMF", "Krishnagiri", "Thanjavur",
-    "MPMMCC", "CCHRC", "Borooah", "Goa",
+    "MPMMCC", "CCHRC", "BOROOAH", "Goa",
 ]
 
 AMBER_HIGH = "#E0631A"
@@ -347,7 +347,8 @@ button[kind="secondary"],
 }
 
 .block-container {
-    padding-top: 1rem !important;
+    padding-top: 0 !important;
+    margin-top: -25px !important;
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -1711,14 +1712,15 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
     # Per-site text position overrides to avoid label collisions
     _TEXT_POS = {
         "West Bengal":           "top right",
-        "Kolkata Medical College": "bottom right",
+        "Kolkata":               "bottom right",
         "Mathura":               "middle right",
         "Kohima":                "middle right",
         "Goa":                   "middle right",
         "Thanjavur":             "middle right",
-        "AIIMS Delhi":           "top left",
+        "Delhi":                 "top left",
         "Varanasi":              "middle right",
-        "Cachar & Guwahati":     "middle right",
+        "Silchar":               "middle right",
+        "Ghuwahati":             "middle right",
         "Bangalore":             "middle right",
     }
 
