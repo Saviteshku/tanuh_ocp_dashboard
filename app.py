@@ -1,7 +1,7 @@
 """
 ====================================================================
 AAROGYA AAROHAN — REAL-TIME MONITORING DASHBOARD  v3
-IISC Oral Cancer Project / TANUH
+Oral Cancer Project / TANUH
 
 Combined dataset : OCP_COMB_DATA_OVERALL.parquet
   phase == '1'  → Phase 1 records
@@ -129,19 +129,83 @@ if screen_width is None:
 
 # ── Responsive breakpoints (mirrors common phone/tablet/desktop widths) ──
 BP_PHONE  = 640   # < 640px  → phone
-BP_TABLET = 1024  # 640–1024 → tablet, > 1024 → desktop
+BP_TABLET = 1024  # 640–1024 → tablet, 1024–1440 → laptop, > 1440 → desktop
+BP_LAPTOP = 1440  # 13"/14" laptops typically report ~1280–1440 CSS px here
 
-IS_PHONE  = screen_width < BP_PHONE
-IS_TABLET = BP_PHONE <= screen_width < BP_TABLET
-IS_DESKTOP = screen_width >= BP_TABLET
+IS_PHONE   = screen_width < BP_PHONE
+IS_TABLET  = BP_PHONE <= screen_width < BP_TABLET
+IS_LAPTOP  = BP_TABLET <= screen_width < BP_LAPTOP
+IS_DESKTOP = screen_width >= BP_LAPTOP
+
+# A 14" laptop window (~1280–1440px) used to fall into the same catch-all
+# "desktop" bucket as a 1800–2500px external monitor, so charts/cards were
+# sized as if they had a big monitor's worth of room and then clipped when
+# they didn't get it. IS_LAPTOP splits that bucket out; CONTENT_WIDTH and
+# _interp() below replace the old hardcoded per-bucket values with sizing
+# that scales continuously with the space actually available, so every
+# width in between — not just the three original buckets — gets a
+# proportionate result instead of jumping between fixed sizes.
+
+# Rough width Streamlit's expanded sidebar + page padding subtract from the
+# window, so width-driven sizing is based on the space actually left for
+# content rather than the raw (sidebar-inclusive) window width reported by
+# the browser. The sidebar collapses to an overlay on phone, so it doesn't
+# eat into content width there.
+_SIDEBAR_PX = 260
+CONTENT_WIDTH = screen_width if IS_PHONE else max(screen_width - _SIDEBAR_PX, 320)
+
+
+def _interp(x: float, points: list[tuple[float, float]]) -> float:
+    """Piecewise-linear interpolation of `points` (a list of (x, value)
+    pairs) at `x`, clamped to the first/last value outside the given
+    range. This is what makes chart/card sizing "dynamic" rather than
+    bucketed — any in-between width (e.g. a 1366px laptop sitting between
+    the old tablet/desktop cutoffs) gets a proportionate size instead of
+    being rounded up or down to whichever fixed bucket it technically
+    fell into.
+    """
+    pts = sorted(points)
+    if x <= pts[0][0]:
+        return pts[0][1]
+    if x >= pts[-1][0]:
+        return pts[-1][1]
+    for (x0, v0), (x1, v1) in zip(pts, pts[1:]):
+        if x0 <= x <= x1:
+            t = (x - x0) / (x1 - x0)
+            return v0 + t * (v1 - v0)
+    return pts[-1][1]
+
+
+def _row_width(n_cols: int) -> int:
+    """Estimated pixel width of a single card/chart when CONTENT_WIDTH is
+    split into `n_cols` side-by-side st.columns (roughly accounts for the
+    gap Streamlit inserts between columns). Sizing cards/legends off this
+    — instead of off the raw window width — is what keeps a 4-across card
+    row correctly sized whether the window is a 1366px laptop or a
+    2560px monitor, rather than only checking the window width and
+    assuming every column got an equal share of a much wider screen.
+    """
+    n_cols = max(n_cols, 1)
+    gap = 16 * (n_cols - 1)
+    return max((CONTENT_WIDTH - gap) // n_cols, 160)
+
+
+# Registrations / suspicious-status charts and the phase-2 sankey always
+# render as one of two side-by-side columns on tablet/laptop/desktop, and
+# full-width on phone — used to size their legends/heights off their
+# actual rendered width instead of the full window width.
+CHART_WIDTH = CONTENT_WIDTH if IS_PHONE else _row_width(2)
 
 
 def _cols(n_desktop: int, n_tablet: int | None = None, n_phone: int = 1):
     """Return the column count to use for the current screen size.
 
-    n_desktop applies >= BP_TABLET, n_tablet applies on tablet widths
-    (defaults to n_desktop if not given, capped at 2-3 cols), n_phone
-    applies on phones (defaults to a single stacked column).
+    n_desktop applies >= BP_TABLET (laptop and desktop alike — the row is
+    still split into this many columns; _row_width()/_interp() are what
+    adjust the per-column *sizing* between a laptop and a large monitor),
+    n_tablet applies on tablet widths (defaults to n_desktop if not
+    given, capped at 2-3 cols), n_phone applies on phones (defaults to a
+    single stacked column).
     """
     if IS_PHONE:
         return n_phone
@@ -190,7 +254,7 @@ GEOJSON_DATA_DIR = BASE / "static"
 
 SITE_ORDER = [
     "KLE", "AIIMS Delhi", "MSMF", "Krishnagiri", "Thanjavur",
-    "MPMMCC", "CCHRC", "BOROOAH", "Goa",
+    "MPMMCC", "CCHRC", "BBCI", "Goa",
 ]
 
 AMBER_HIGH = "#E0631A"
@@ -739,6 +803,13 @@ def _gender_col(df: pd.DataFrame) -> str | None:
     return None
 
 
+def _study_setting_col(df: pd.DataFrame) -> str | None:
+    for c in ("study_setting", "Study_Setting", "Study Setting"):
+        if c in df.columns:
+            return c
+    return None
+
+
 def _ai_result_col(df: pd.DataFrame) -> str | None:
     for c in ("ai_result", "AI_Result", "AI Result"):
         if c in df.columns:
@@ -939,30 +1010,32 @@ def monthly_stats(
 # ════════════════════════════════════════════════════════════════════
 
 
-def map_height_from_width(width:int)->int:
-    if width >= 2400:
-        return 1150
-    elif width >= 1800:
-        return 1000
-    elif width >= 1400:
-        return 800
-    elif width >= 1000:
-        return 750
-    elif width >= 640:
-        return 500
-    # Phone: map + legend share a stacked layout, so neither needs the
-    # tall fixed height used on wider screens.
-    return 500
+def map_height_from_width(width: int) -> int:
+    # Continuous instead of bucketed, so a 14" laptop's content width
+    # (typically ~1000-1200px after the sidebar) gets a proportionate
+    # height instead of being rounded up to whatever the nearest bucket
+    # used to be.
+    return round(_interp(width, [
+        (640, 500), (1000, 750), (1200, 800), (1400, 850),
+        (1800, 1000), (2400, 1150),
+    ]))
+
 
 def plot_height_from_width(width: int) -> int:
-    if width >= 2200:
-        return 650
-    elif width >= 1700:
-        return 550
-    elif width >= 1300:
-        return 500
-    else:
-        return 400
+    # NOTE: `width` here is expected to be CHART_WIDTH — the actual
+    # rendered width of one half of a 2-column chart row, not the full
+    # window/content width. A 1920px laptop window nets a ~820px chart
+    # column; a 2560px monitor nets a ~1140px column. The anchors below
+    # are calibrated to that (roughly 300–1800px) range so the height
+    # keeps growing meaningfully all the way up to large monitors,
+    # instead of the old anchors (tuned for full window width, topping
+    # out at 2200px — a figure a half-column practically never reaches)
+    # which made every screen from a 14" laptop up to a 32" 4K monitor
+    # land in the same flat, undersized range.
+    return round(_interp(width, [
+        (300, 360), (500, 410), (700, 460), (822, 500),
+        (1000, 580), (1142, 660), (1400, 740), (1800, 820),
+    ]))
 
 
 # Standard browser rendering is ~96 CSS px/inch. Plotly's exported-image
@@ -1105,7 +1178,7 @@ def _fig_registrations(mon: pd.DataFrame) -> go.Figure:
         ),
     }
     fig.update_layout(**reg_layout)
-    fig.update_layout(height=plot_height_from_width(screen_width))
+    fig.update_layout(height=plot_height_from_width(CHART_WIDTH))
     return fig
 
 
@@ -1215,13 +1288,20 @@ def _fig_status(mon: pd.DataFrame, status_label: str, suspicious_label: str) -> 
 
     # Legend tends to wrap to 2 lines on narrow screens (3 entries don't
     # fit on one line), so give it a smaller font and more headroom there
-    # to avoid colliding with the bars.
-    if IS_PHONE:
-        legend_font, top_margin, legend_y = 10, 86, 1.22
-    elif IS_TABLET:
-        legend_font, top_margin, legend_y = 12, 76, 1.18
-    else:
-        legend_font, top_margin, legend_y = 14, 64, 1.16
+    # to avoid colliding with the bars. Sized continuously off CHART_WIDTH
+    # (this chart's actual rendered width — half of CONTENT_WIDTH on
+    # tablet/laptop/desktop, full width on phone) rather than three fixed
+    # buckets, so a 14" laptop's narrower half-column doesn't get the same
+    # font/margin as a large monitor's and wrap/clip against the bars.
+    legend_font = round(_interp(CHART_WIDTH, [
+        (300, 10), (450, 11), (600, 12), (800, 13), (1000, 14),
+    ]))
+    top_margin = round(_interp(CHART_WIDTH, [
+        (300, 90), (450, 80), (600, 72), (800, 66), (1000, 64),
+    ]))
+    legend_y = _interp(CHART_WIDTH, [
+        (300, 1.24), (450, 1.20), (600, 1.18), (800, 1.16), (1000, 1.16),
+    ])
 
     susp_layout = {
         **_BASE_LAYOUT,
@@ -1246,7 +1326,7 @@ def _fig_status(mon: pd.DataFrame, status_label: str, suspicious_label: str) -> 
         ),
     }
     fig.update_layout(**susp_layout)
-    fig.update_layout(height=plot_height_from_width(screen_width))
+    fig.update_layout(height=plot_height_from_width(CHART_WIDTH))
     return fig
 
 
@@ -1484,6 +1564,39 @@ def _duration_text(df: pd.DataFrame) -> str:
     month_label = "month" if months == 1 else "months"
     return f"({start.strftime('%b %Y')} – {end.strftime('%b %Y')} · {months} {month_label})"
 
+def _card_font_sizes(card_w: int, ticker: bool = False) -> tuple[int, int, str, int]:
+    """Continuous font/padding/height sizing for the HTML metric cards,
+    driven by the card's *actual* rendered width (CONTENT_WIDTH divided by
+    however many st.columns it shares a row with — see _row_width())
+    rather than the raw window width. This is what a fixed 3-bucket
+    (phone/tablet/desktop) scheme got wrong: a 4-across card row on a 14"
+    laptop has a much narrower per-card width than a 4-across row on a
+    big external monitor, even though both windows fall in the same
+    "desktop" bucket — the old fixed desktop font size overflowed the
+    laptop's narrower card and, combined with the card's overflow:hidden,
+    clipped the bottom scrolling state-name ticker line.
+    """
+    big = round(_interp(card_w, [
+        (160, 18), (220, 22), (300, 27), (380, 31), (460, 34), (600, 36),
+    ]))
+    sub = round(_interp(card_w, [
+        (160, 10), (220, 12), (300, 13), (380, 15), (460, 16), (600, 17),
+    ]))
+    pad_h = round(_interp(card_w, [(160, 12), (460, 24)]))
+    pad_t = round(_interp(card_w, [(160, 7), (460, 10)]))
+    pad_b = round(_interp(card_w, [(160, 5), (460, 8)]))
+    height = round(_interp(card_w, [
+        (160, 96), (220, 104), (300, 114), (380, 122), (460, 128), (600, 130),
+    ]))
+    if ticker:
+        # The scrolling state-name line sits below the label and needs a
+        # bit of extra headroom on top of the base card height, or its
+        # last few pixels get clipped by the card's overflow:hidden.
+        height += 12
+    pad = f"{pad_t}px {pad_h}px {pad_b}px"
+    return big, sub, pad, height
+
+
 def _animated_metric_card(
     value: int,
     suffix: str = "",
@@ -1492,8 +1605,17 @@ def _animated_metric_card(
     big_color: str = "#228B22",
     border_color: str = "#228B22",
     animate: bool = False,
+    n_cols: int = 2,
+    height_override: int | None = None,
 ) -> None:
-    """Render a metric card; animate count-up only when animate=True."""
+    """Render a metric card; animate count-up only when animate=True.
+    `n_cols` is how many st.columns share the row this card is placed in
+    — used to size fonts off the card's actual rendered width instead of
+    the raw window width (see _card_font_sizes). `height_override` forces
+    a specific total card height — pass this when the card shares a row
+    with a `_map_stat_card` (which needs extra height for its scrolling
+    ticker line) so every card in that row ends up the same height
+    instead of the ticker cards being taller."""
     safe_sub      = html.escape(sub_text)
     safe_dur_text = html.escape(duration_text)
     safe_suffix   = json.dumps(suffix)
@@ -1504,13 +1626,9 @@ def _animated_metric_card(
         if duration_text else ""
     )
 
-    # Scale type/padding/height down for phone and tablet so nothing clips.
-    if IS_PHONE:
-        big_font, sub_font, pad, card_height = 26, 13, "8px 16px 6px", 116
-    elif IS_TABLET:
-        big_font, sub_font, pad, card_height = 31, 15, "9px 20px 7px", 122
-    else:
-        big_font, sub_font, pad, card_height = 36, 17, "10px 24px 8px", 130
+    big_font, sub_font, pad, card_height = _card_font_sizes(_row_width(n_cols))
+    if height_override is not None:
+        card_height = height_override
 
     if animate:
         script   = f"""<script>
@@ -1555,25 +1673,40 @@ requestAnimationFrame(step);
     st.iframe(_html, height=card_height)
 
 
-def _map_stat_card(value: int, label: str, items: list[str], big_color: str, border_color: str) -> None:
-    """Animated card with count-up and scrolling state-name ticker."""
+def _map_stat_card(
+    value: int,
+    label: str,
+    items: list[str],
+    big_color: str,
+    border_color: str,
+    n_cols: int = 4,
+    height_override: int | None = None,
+) -> None:
+    """Animated card with count-up and scrolling state-name ticker.
+    `n_cols` is how many st.columns share the row this card is placed in
+    — used to size fonts/height off the card's actual rendered width
+    (see _card_font_sizes) so the ticker line has enough headroom instead
+    of getting clipped by the card's fixed overflow:hidden height.
+    `height_override` forces a specific total card height — pass this
+    alongside plain `_animated_metric_card`s in the same row so every card
+    in the row ends up the same height instead of just the ticker cards
+    being taller."""
     # Escape content sourced from external JSON to prevent HTML injection.
     safe_label = html.escape(label)
     safe_items = [html.escape(s) for s in items]
     items_str  = " · ".join(safe_items) if safe_items else ""
 
-    if IS_PHONE:
-        big_font, sub_font, pad, card_height = 24, 13, "8px 16px 6px", 104
-    elif IS_TABLET:
-        big_font, sub_font, pad, card_height = 29, 15, "9px 20px 7px", 110
-    else:
-        big_font, sub_font, pad, card_height = 36, 17, "10px 24px 8px", 114
+    card_w = _row_width(n_cols)
+    big_font, sub_font, pad, card_height = _card_font_sizes(card_w, ticker=True)
+    if height_override is not None:
+        card_height = height_override
+    ticker_font = round(_interp(card_w, [(160, 9), (300, 10), (460, 11)]))
 
     scroll_html = ""
     if items_str:
         scroll_html = (
             '<div style="overflow:hidden;white-space:nowrap;margin-top:5px;">'
-            '<span style="display:inline-block;font-size:11px;color:#888;'
+            f'<span style="display:inline-block;font-size:{ticker_font}px;color:#888;'
             f'animation:ov-scroll {max(8, len(items)*2)}s linear infinite;">'
             f'{items_str}&nbsp;&nbsp;&nbsp;</span></div>'
             '<style>@keyframes ov-scroll{'
@@ -1660,7 +1793,7 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
         elif key in future_set:
             status, z_val = "Upcoming", 1
         else:
-            status, z_val = "Other", 0
+            status, z_val = "Not Covered", 0
         rows.append({
             "state":  raw_name,
             "z":      z_val,
@@ -1697,11 +1830,20 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
         marker_line_width=0.8,
     ))
 
+    # Site-name labels next to pins, and the legend block below, are both
+    # sized off `width` (the map's actual rendered width, passed in by the
+    # caller as CONTENT_WIDTH) continuously rather than a single fixed
+    # size — a 14" laptop's ~1000-1200px content width previously got the
+    # same fixed sizes as an 1800px+ external monitor and overflowed.
+    _pin_font_size = round(_interp(width, [
+        (640, 11), (1000, 13), (1400, 15), (1800, 16),
+    ]))
+
     # ── Site pins from map_data ──────────────────────────────────────
     map_sites = map_data.get("map_sites", [])
 
     _PIN_COLORS = {
-        "district_sentinel": {"ongoing": "#C0392B", "upcoming": "#C0392B"},
+        "district_sentinel": {"ongoing": "#b61ff7", "upcoming": "#b61ff7"},
         "sentinel":          {"ongoing": "#2980B9", "upcoming": "#2980B9"},
     }
     _PIN_LABELS = {
@@ -1720,35 +1862,47 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
         "Delhi":                 "top left",
         "Varanasi":              "middle right",
         "Silchar":               "middle right",
-        "Guwahati":              "top left",
+        "Guwahati":              "top center",
         "Bangalore":             "middle right",
+    }
+
+    # Subsite font colors by status — green for ongoing, yellow for
+    # upcoming, red for stopped.
+    _SUBSITE_COLORS = {
+        "ongoing":  "#1CBD1C",
+        "upcoming": "#C08909",
+        "stopped":   "#D93025",
     }
 
     for site_type, label in _PIN_LABELS.items():
         sites = [s for s in map_sites if s.get("type") == site_type]
         if not sites:
             continue
-        color = "#C0392B" if site_type == "district_sentinel" else "#2980B9"
+        color = "#b61ff7" if site_type == "district_sentinel" else "#2980B9"
 
         # Add each site as a separate trace so textposition can vary per pin
         for i, s in enumerate(sites):
             name = s.get("name", "")
             tpos = _TEXT_POS.get(name, "middle right")
 
-            # Hover text: site name, then any *ongoing* or *upcoming*
-            # subsites listed indented on their own line below it
-            # (halted/other-status subsites are left out of the hover
-            # entirely).
-            visible_subs = [
-                sub.get("name", "")
-                for sub in s.get("subsites", [])
-                if sub.get("status") in ("ongoing", "upcoming")
-            ]
+            # Hover text: site name, then ALL subsites listed indented on
+            # their own line below it, font-colored by status (green =
+            # ongoing, yellow = upcoming, red = stopped). Stopped subsites
+            # are always sorted to the bottom of the list; sort is stable
+            # so relative order within each group is preserved.
+            all_subs = sorted(
+                s.get("subsites", []),
+                key=lambda sub: 1 if sub.get("status") == "stopped" else 0,
+            )
             hover_lines = [f"<b>{html.escape(name)}</b>"]
-            hover_lines += [
-                f"&nbsp;&nbsp;&nbsp;&nbsp;{html.escape(sub_name)}"
-                for sub_name in visible_subs
-            ]
+            for sub in all_subs:
+                sub_name   = sub.get("name", "")
+                sub_status = sub.get("status", "")
+                sub_color  = _SUBSITE_COLORS.get(sub_status, "#484848")
+                hover_lines.append(
+                    f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:{sub_color};">'
+                    f"{html.escape(sub_name)}</span>"
+                )
             hover_text = "<br>".join(hover_lines)
 
             fig.add_trace(go.Scattergeo(
@@ -1763,7 +1917,7 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
                 ),
                 text=[name],
                 textposition=tpos,
-                textfont=dict(size=14, color=color),
+                textfont=dict(size=_pin_font_size, color=color),
                 name=label if i == 0 else "",
                 customdata=[hover_text],
                 hovertemplate="%{customdata}<extra></extra>",
@@ -1793,7 +1947,7 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
                 '<span style="color:#dfe0ea;font-size:15px;">■</span>'
                 '<span style="font-size:11px;"> Not Covered</span>'
                 '<br>'
-                '<span style="color:#C0392B;font-size:13px;">⬤</span>'
+                '<span style="color:#b61ff7;font-size:13px;">⬤</span>'
                 '<span style="font-size:10px;"> District/Sentinel Site &nbsp;</span>'
                 '<span style="color:#2980B9;font-size:13px;">⬤</span>'
                 '<span style="font-size:10px;"> Sentinel Site</span>'
@@ -1804,8 +1958,20 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
             borderwidth=0,
         )
     else:
+        # Continuous legend sizing: was a single fixed 22px-square /
+        # 16px-text block regardless of width, which is what overflowed
+        # the (also-fixed) 220px right margin on a 14" laptop's narrower
+        # content width. Both the glyph/text sizes and the x position now
+        # scale down together with `width` so the legend still fits
+        # inside whatever margin `margin_r` below actually reserves for it.
+        _leg_text = round(_interp(width, [
+            (640, 11), (900, 12), (1100, 13), (1400, 14), (1800, 15), (2400, 16),
+        ]))
+        _leg_box = _leg_text + 6
+        _leg_dot = _leg_text + 4
+        _leg_x = _interp(width, [(640, 0.66), (1100, 0.72), (1800, 0.75)])
         fig.add_annotation(
-            x=0.75,
+            x=_leg_x,
             y=0.25,
             xref="paper",
             yref="paper",
@@ -1813,22 +1979,25 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
             yanchor="middle",
             showarrow=False,
             text=(
-                '<span style="color:#64E64A;font-size:22px;">■</span>'
-                '<span style="font-size:16px;"> Ongoing</span>'
+                f'<span style="color:#64E64A;font-size:{_leg_box}px;">■</span>'
+                f'<span style="font-size:{_leg_text}px;"> Ongoing</span>'
                 '<br>'
-                '<span style="color:#F4CA67;font-size:22px;">■</span>'
-                '<span style="font-size:16px;"> Upcoming</span>'
+                f'<span style="color:#F4CA67;font-size:{_leg_box}px;">■</span>'
+                f'<span style="font-size:{_leg_text}px;"> Upcoming</span>'
                 '<br>'
-                '<span style="color:#dfe0ea;font-size:22px;">■</span>'
-                '<span style="font-size:16px;"> Not Covered</span>'
+                f'<span style="color:#D93025;font-size:{_leg_box}px;">■</span>'
+                f'<span style="font-size:{_leg_text}px;"> Stopped</span>'
+                '<br>'
+                f'<span style="color:#dfe0ea;font-size:{_leg_box}px;">■</span>'
+                f'<span style="font-size:{_leg_text}px;"> Not Covered</span>'
                 '<br><br>'
-                '<span style="color:#C0392B;font-size:20px;">⬤</span>'
-                '<span style="font-size:16px;"> District Level Deployment &amp; Sentinel Site</span>'
+                f'<span style="color:#b61ff7;font-size:{_leg_dot}px;">⬤</span>'
+                f'<span style="font-size:{_leg_text}px;"> District Level Deployment &amp; Sentinel Site</span>'
                 '<br>'
-                '<span style="color:#2980B9;font-size:20px;">⬤</span>'
-                '<span style="font-size:16px;"> Sentinel Site</span>'
+                f'<span style="color:#2980B9;font-size:{_leg_dot}px;">⬤</span>'
+                f'<span style="font-size:{_leg_text}px;"> Sentinel Site</span>'
             ),
-            font=dict(size=16),
+            font=dict(size=_leg_text),
             align="left",
             bgcolor="rgba(0,0,0,0)",
             borderwidth=0,
@@ -1850,10 +2019,18 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
         # keeps the always-visible zoom mode bar clear of the map outline.
         margin = dict(t=26, b=70, l=4, r=4)
     else:
-        margin = dict(t=26, b=30, l=10, r=220)  # tight top margin keeps stat cards close to the map
+        # Right margin reserved for the legend column — scales with width
+        # so it always has (roughly) enough room for the legend text
+        # above at that width, instead of a fixed 220px that was sized
+        # for a large monitor and left too little room at laptop widths.
+        _margin_r = round(_interp(width, [
+            (640, 130), (900, 155), (1100, 175), (1400, 195), (1800, 215), (2400, 230),
+        ]))
+        margin = dict(t=26, b=30, l=10, r=_margin_r)  # tight top margin keeps stat cards close to the map
 
     fig.update_layout(
         height=map_height_from_width(width),
+        hoverlabel_font_size=14,
         margin=margin,
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -1892,7 +2069,8 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
 
     st.markdown("<div style='height:4px;'></div>", unsafe_allow_html=True)
 
-    ov_cards = st.columns(_cols(2, 2, 1), gap="large")
+    ov_n = _cols(2, 2, 1)
+    ov_cards = st.columns(ov_n, gap="large")
     col_l = ov_cards[0]
     col_r = ov_cards[1] if len(ov_cards) > 1 else ov_cards[0]
 
@@ -1906,6 +2084,7 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
             big_color="#228B22",
             border_color="#228B22",
             animate=True,
+            n_cols=ov_n,
         )
         st.plotly_chart(
             _fig_registrations(mon),
@@ -1922,7 +2101,7 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
 
         st.markdown(
             f'<div class="ocp-card ocp-card-amb ocp-card-dualstat" style="padding:10px 24px 8px;">'
-            f'<div class="card-dualstat-row">'
+            f'<div class="card-dualstat-row" style="font-size:35px;">'
             f'<span>Suspicious: {total_susp:,} ({susp_rate}%)</span>'
             f'<span class="dualstat-sep">|</span>'
             f'<span class="dualstat-high">High risk: {high_total:,} ({high_pct}%)</span>'
@@ -1946,18 +2125,24 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         )
         phones     = int(map_data.get("phones_deployed",    0))
         fhw        = int(map_data.get("fhw_trained",        0))
-        facilities = int(map_data.get("facilities_covered", 0))
         ongoing    = map_data.get("ongoing_states", [])
         future     = map_data.get("upcoming_states",  [])
 
-        mc_n = _cols(5, 3, 1)
+        mc_n = _cols(4, 3, 1)
         mc_cols = st.columns(mc_n, gap="small")
+        # Two of these four cards (_map_stat_card) carry a scrolling
+        # state-name ticker line and need a bit more height than the two
+        # plain _animated_metric_cards — left to size themselves
+        # independently, that height difference showed up as the row's
+        # boxes not lining up. Compute one shared height (the taller,
+        # ticker-inclusive variant) up front and force every card in the
+        # row to that height so they stay visually uniform.
+        mc_card_h = _card_font_sizes(_row_width(mc_n), ticker=True)[3]
         mc_cards = [
-            (lambda: _map_stat_card(len(ongoing), "📍Ongoing States/UTs", ongoing, "#237213", "#237113")),
-            (lambda: _animated_metric_card(facilities, "", "🏨 Healthcare Facilities Covered", "", "#0771eb", "#0771eb", animate=True)),
-            (lambda: _animated_metric_card(fhw,        "", "👩‍⚕️ Frontline Health Worker Trained", "", "#0771eb", "#0771eb", animate=True)),
-            (lambda: _animated_metric_card(phones,     "", "📱 Phones Deployed", "", "#0771eb", "#0771eb", animate=True)),
-            (lambda: _map_stat_card(len(future),  "📍 Upcoming States", future,  "#F4CA67", "#F4CA67")),
+            (lambda: _map_stat_card(len(ongoing), "📍Ongoing States/UTs", ongoing, "#237213", "#237113", n_cols=mc_n, height_override=mc_card_h)),
+            (lambda: _animated_metric_card(fhw,        "", "👩‍⚕️ Frontline Health Worker Trained", "", "#0771eb", "#0771eb", animate=True, n_cols=mc_n, height_override=mc_card_h)),
+            (lambda: _animated_metric_card(phones,     "", "📱 Phones Deployed", "", "#0771eb", "#0771eb", animate=True, n_cols=mc_n, height_override=mc_card_h)),
+            (lambda: _map_stat_card(len(future),  "📍 Upcoming States", future,  "#F4CA67", "#F4CA67", n_cols=mc_n, height_override=mc_card_h)),
         ]
         for i, card_fn in enumerate(mc_cards):
             with mc_cols[i % mc_n]:
@@ -1971,7 +2156,7 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
 
         df_for_map = df_map if df_map is not None else df
         with st.spinner("Loading Map..."):
-            fig_map = _fig_india_map(df_for_map, map_data, width=screen_width)
+            fig_map = _fig_india_map(df_for_map, map_data, width=CONTENT_WIDTH)
         if fig_map is not None:
             st.plotly_chart(
                 fig_map,
@@ -2060,17 +2245,17 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
 
                 rows_html.append(
                     "<tr>"
-                    f"<td style='padding:9px 14px;text-align:left;font-weight:600;"
+                    f"<td style='padding:5px 10px;text-align:left;font-weight:600;"
                     f"color:#333;border-top:1px solid #eee;'>{html.escape(site)}</td>"
-                    f"<td style='padding:9px 14px;text-align:center;font-weight:600;"
+                    f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
                     f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(state_str)}</td>"
-                    f"<td style='padding:9px 14px;text-align:center;font-weight:600;"
+                    f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
                     f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(duration_str)}</td>"
-                    f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
+                    f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
                     f"color:#228B22;border-top:1px solid #eee;'>{screened:,}</td>"
-                    f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
+                    f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
                     f"color:#F4A900;border-top:1px solid #eee;'>{susp:,} ({susp_pct}%)</td>"
-                    f"<td style='padding:9px 14px;text-align:center;font-weight:700;"
+                    f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
                     f"color:#D94040;border-top:1px solid #eee;'>{high:,} ({high_pct}%)</td>"
                     "</tr>"
                 )
@@ -2131,7 +2316,8 @@ def _tab_phase1(df: pd.DataFrame) -> None:
 
     st.markdown("<div style='height:4px;'></div>", unsafe_allow_html=True)
 
-    p1_cards = st.columns(_cols(2, 2, 1), gap="large")
+    p1_n = _cols(2, 2, 1)
+    p1_cards = st.columns(p1_n, gap="large")
     col_l = p1_cards[0]
     col_r = p1_cards[1] if len(p1_cards) > 1 else p1_cards[0]
 
@@ -2145,6 +2331,7 @@ def _tab_phase1(df: pd.DataFrame) -> None:
             big_color="#228B22",
             border_color="#228B22",
             animate=True,
+            n_cols=p1_n,
         )
         st.plotly_chart(
             _fig_registrations(mon),
@@ -2161,7 +2348,7 @@ def _tab_phase1(df: pd.DataFrame) -> None:
 
         st.markdown(
             f'<div class="ocp-card ocp-card-amb ocp-card-dualstat" style="padding:10px 24px 8px;">'
-            f'<div class="card-dualstat-row">'
+            f'<div class="card-dualstat-row" style="font-size:35px;">'
             f'<span>Suspicious: {total_susp:,} ({susp_rate}%)</span>'
             f'<span class="dualstat-sep">|</span>'
             f'<span class="dualstat-high">High risk: {high_total:,} ({high_pct}%)</span>'
@@ -2198,7 +2385,8 @@ def _tab_phase2(df: pd.DataFrame) -> None:
 
     st.markdown("<div style='height:4px;'></div>", unsafe_allow_html=True)
 
-    p2_cards = st.columns(_cols(2, 2, 1), gap="large")
+    p2_n = _cols(2, 2, 1)
+    p2_cards = st.columns(p2_n, gap="large")
     col_l = p2_cards[0]
     col_r = p2_cards[1] if len(p2_cards) > 1 else p2_cards[0]
 
@@ -2212,6 +2400,7 @@ def _tab_phase2(df: pd.DataFrame) -> None:
             big_color="#228B22",
             border_color="#228B22",
             animate=True,
+            n_cols=p2_n,
         )
         st.plotly_chart(
             _fig_registrations(mon),
@@ -2248,9 +2437,10 @@ def _tab_phase2(df: pd.DataFrame) -> None:
             duration_text="",
             big_color="#F4A900",
             border_color="#F4A900",
+            n_cols=p2_n,
         )
         st.plotly_chart(
-            _fig_sankey_phase2(df, screen_width),
+            _fig_sankey_phase2(df, CHART_WIDTH),
             width="stretch",
             config=_hires_plot_config("phase2_ai_pathway_sankey", width=1500, height=850),
             key="p2_sankey",
@@ -2311,7 +2501,7 @@ def main() -> None:
                 )
 
             title_size = "1.3rem" if IS_PHONE else "2rem"
-            sub_size   = ".72rem" if IS_PHONE else ".82rem"
+            sub_size   = ".82rem" if IS_PHONE else ".92rem"
 
             st.markdown(
                 f"""
@@ -2332,12 +2522,12 @@ def main() -> None:
                         </div>
                         <div style="
                             font-size:{sub_size};
-                            color:#b0b0b0;
+                            color:#737373;
                             margin-top:2px;
                             white-space:nowrap;
                             overflow:hidden;
                             text-overflow:ellipsis;">
-                            TANUH · IISc Oral Cancer Project · Real-time Dashboard
+                            TANUH · Oral Cancer Screening Project · Dashboard
                         </div>
                     </div>
                 </div>
@@ -2455,6 +2645,21 @@ def main() -> None:
     if gender_values:
         gender_sel = st.sidebar.selectbox("👤 Gender", ["All"] + gender_values, key=f"gx_{_f}")
 
+    # Study setting filter
+    setting_col = _study_setting_col(df_raw)
+    setting_values: list[str] = []
+    if setting_col:
+        setting_values = sorted(
+            v for v in df_raw[setting_col].dropna().astype(str).unique().tolist()
+            if v.strip().lower() not in ("nan", "none", "", "-", ".")
+        )
+
+    setting_sel = "All"
+    if setting_values:
+        setting_sel = st.sidebar.selectbox(
+            "🏨 Study Setting", ["All"] + setting_values, key=f"ss_{_f}"
+        )
+
     # Site filter
     site_sel = "All"
     if live_sites:
@@ -2487,6 +2692,12 @@ def main() -> None:
             if gender_col in _df.columns:
                 _df.drop(_df.index[_df[gender_col].astype(str) != gender_sel], inplace=True)
 
+    # Study setting filter
+    if setting_sel != "All" and setting_col:
+        for _df in (df_all, df_p1, df_p2):
+            if setting_col in _df.columns:
+                _df.drop(_df.index[_df[setting_col].astype(str) != setting_sel], inplace=True)
+
     # Snapshot for Overall map — date + gender only, no site filter
     df_all_map = df_all.copy()
 
@@ -2512,7 +2723,7 @@ def main() -> None:
         st.markdown(
             '<div style="text-align:center;padding:10px 0;font-size:12px;color:#c0c0c0;">'
             '<b style="color:#0771eb;">Aarogya Aarohan</b>&nbsp;·&nbsp;'
-            'TANUH Oral Cancer Project&nbsp;·&nbsp;© 2026'
+            'TANUH Oral Cancer Screening Project&nbsp;·&nbsp;© 2026'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -2579,9 +2790,12 @@ def main() -> None:
     # Footer
     st.markdown("---")
     st.markdown(
-        '<div style="text-align:center;padding:10px 0;font-size:12px;color:#c0c0c0;">'
+        '<div style="text-align:center;padding:10px 0;font-size:12px;color:#737373;">'
         '<b style="color:#0771eb;">Aarogya Aarohan</b>&nbsp;·&nbsp;'
-        'TANUH Oral Cancer Project&nbsp;·&nbsp;© 2026'
+        'TANUH Oral Cancer Screening Project<br>'
+        'Email: <a href="mailto:oralcancerscreening@tanuh.ai" '
+        'style="color:#0771eb;text-decoration:none;">oralcancerscreening@tanuh.ai</a>'
+        '&nbsp;·&nbsp;© 2026'
         '</div>',
         unsafe_allow_html=True,
     )
