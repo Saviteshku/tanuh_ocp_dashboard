@@ -4,8 +4,8 @@ AAROGYA AAROHAN — REAL-TIME MONITORING DASHBOARD  v3
 Oral Cancer Project / TANUH
 
 Combined dataset : OCP_COMB_DATA_OVERALL.parquet
-  phase == '1'  → Phase 1 records
-  phase == '2'  → Phase 2 records
+  phase == '1'  → Image-Based Screening records
+  phase == '2'  → AI-Enabled Screening records
   Overall tab   → full combined dataset
 
 Run:
@@ -190,6 +190,21 @@ def _row_width(n_cols: int) -> int:
     return max((CONTENT_WIDTH - gap) // n_cols, 160)
 
 
+def _weighted_col_width(weights: list[float], idx: int) -> int:
+    """Like `_row_width`, but for a row of st.columns given unequal
+    relative widths (as passed to `st.columns([...])`) instead of an
+    equal n-way split. Used when one card in a row needs more horizontal
+    room than its neighbors (e.g. a longer label) — the other columns in
+    the row shrink proportionally to make room for it, rather than every
+    column claiming a fixed equal share regardless of content.
+    """
+    n_cols = max(len(weights), 1)
+    gap = 16 * (n_cols - 1)
+    avail = max(CONTENT_WIDTH - gap, 0)
+    total = sum(weights) or 1.0
+    return max(round(avail * weights[idx] / total), 160)
+
+
 # Registrations / suspicious-status charts and the phase-2 sankey always
 # render as one of two side-by-side columns on tablet/laptop/desktop, and
 # full-width on phone — used to size their legends/heights off their
@@ -251,10 +266,19 @@ except NameError:
 
 GEOJSON_DATA_DIR = BASE / "static"
 
-
 SITE_ORDER = [
-    "KLE", "AIIMS Delhi", "MSMF", "Krishnagiri", "Thanjavur",
-    "MPMMCC", "CCHRC", "BBCI", "Goa",
+    "Krishnagiri, Tamil Nadu*",
+    "Thanjavur, Tamil Nadu",
+    "South & North District, Goa",
+    "All India Institute of Medical Sciences, Delhi",
+    "Anekel, Bangalore, Karnataka",
+    "Cachar Cancer Hospital & Research Centre, Silchar, Assam",
+    "Dr. Bhubaneswar Borooah Cancer Institute, Guwahati, Assam",
+    "Dr. K&T Keditsu Foundation, Kohima, Nagaland",
+    "Goa Dental College & Hospital, Goa",
+    "KLE Dental College, Bangalore, Karnataka",
+    "Mahamana Pandit Madan Mohan Malaviya Cancer Centre, Delhi",
+    "Mazumdar Shaw Medical Foundation, Kolkata, West Bengal",
 ]
 
 AMBER_HIGH = "#E0631A"
@@ -304,10 +328,12 @@ _CSS = """
     margin: 2px 0 2px;
 }
 
-/* Dual-stat card (e.g. "Suspicious | High risk") — shrinks and wraps
-   instead of clipping when the column gets narrow. */
+/* Dual-stat card (e.g. "Suspicious | High risk") — height is set inline
+   per-render to match the Total Screened card's box height (see
+   _tab_overall / _tab_phase1); min-height is just a floor if that inline
+   value ever comes in low, and overflow stays visible so wrapped text
+   isn't clipped instead of the box growing. */
 .ocp-card-dualstat {
-    height: auto !important;
     min-height: 120px;
     overflow: visible !important;
 }
@@ -370,7 +396,7 @@ button[kind="secondary"],
     line-height: 1.3 !important;
 }
 
-/* Larger section tabs (Overall / Phase 1 / Phase 2). */
+/* Larger section tabs (Overall / Image-Based Screening / AI-Enabled Screening). */
 .st-key-btn_ov button,
 .st-key-btn_p1 button,
 .st-key-btn_p2 button {
@@ -460,7 +486,7 @@ button[kind="secondary"],
     .card-eyebrow {
         font-size: 9.5px;
     }
-    /* Section tabs (Overall / Phase 1 / Phase 2) shrink to fit 3-across */
+    /* Section tabs (Overall / Image-Based Screening / AI-Enabled Screening) shrink to fit 3-across */
     .st-key-btn_ov button,
     .st-key-btn_p1 button,
     .st-key-btn_p2 button {
@@ -550,7 +576,7 @@ class _DataStore:
 
         _CAT_COLS = (
             "ai_result", "suspicion", "risk",
-            "gender", "site_id", "provisional_diagnosis", "phase",
+            "gender", "site_full_id", "provisional_diagnosis", "phase",
         )
         for _c in _CAT_COLS:
             if _c in df.columns and df[_c].dtype == object:
@@ -915,11 +941,11 @@ def monthly_stats(
     """
     Returns one row per calendar month.
 
-    Phase 1 columns:
+    Image-Based Screening columns:
       total, reviewed_total, suspicious, high_risk, low_risk,
       cumulative, susp_pct, non_susp_pct, month_lbl
 
-    Phase 2 columns:
+    AI-Enabled Screening columns:
       total, ai_suspicious, cumulative, month_lbl
     """
     if df.empty or "date_of_case_registered" not in df.columns:
@@ -934,7 +960,7 @@ def monthly_stats(
 
     total = d.groupby("ym")[id_col].nunique().reset_index(name="total")
 
-    # ── Phase 1 ──────────────────────────────────────────────────────
+    # ── Image-Based Screening ──────────────────────────────────────────────────────
     if phase == "phase1":
         reviewed_mask, suspicious_mask, _, _ = _choose_status_masks(d, phase)
         d["_reviewed"] = reviewed_mask
@@ -984,7 +1010,7 @@ def monthly_stats(
         mon["month_lbl"]    = mon["ym"].dt.start_time.dt.strftime("%b %Y")
         return mon
 
-    # ── Phase 2 ──────────────────────────────────────────────────────
+    # ── AI-Enabled Screening ──────────────────────────────────────────────────────
     ai_col = _ai_result_col(d)
 
     if ai_col is not None:
@@ -1158,7 +1184,7 @@ def _fig_registrations(mon: pd.DataFrame) -> go.Figure:
                 0,
                 mon["cumulative"].max() + (5000 if mon["cumulative"].max() > 1000 else 50),
             ],
-            title=dict(text="Cumulative", font=dict(size=14, color="#6036f8")),
+            title=dict(text="Cumulative  Screening", font=dict(size=14, color="#6036f8")),
             showgrid=True,
             gridcolor="#f0f0f0",
             zeroline=False,
@@ -1169,7 +1195,7 @@ def _fig_registrations(mon: pd.DataFrame) -> go.Figure:
                 0,
                 mon["total"].max() + (500 if mon["total"].max() > 1000 else 50),
             ],
-            title=dict(text="Monthly new", font=dict(size=14, color="#3f9d3f")),
+            title=dict(text="Monthly  Screening", font=dict(size=14, color="#3f9d3f")),
             overlaying="y",
             side="right",
             showgrid=False,
@@ -1333,7 +1359,7 @@ def _fig_status(mon: pd.DataFrame, status_label: str, suspicious_label: str) -> 
 @st.cache_data(max_entries=4, ttl=3600, show_spinner=False)
 def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
     """
-    Sankey — Phase 2 pathway:
+    Sankey — AI-Enabled Screening pathway:
       Col0: AI result
       Col1: Not-yet-reviewed remainder (per AI path)
       Col2: All Tele Reviewed (merge node)
@@ -1390,36 +1416,49 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
     labels = [
         f"AI Suspicious\n{ai_s} ({pf(ai_s, total)})",
         f"AI Non-Suspicious\n{ai_ns} ({pf(ai_ns, total)})",
-        f"Pending TSD\n{pend} ({pf(pend, ai_s)})",
-        f"Not Reviewed\n{norev} ({pf(norev, ai_ns)})",
+        f"Pending TSD\n{pend} ({pf(pend, total)})",
+        # On-plot text label hidden on request (node/link/flow unchanged,
+        # hover text below still shows the figures) - original label:
+        # f"Not Reviewed\n{norev} ({pf(norev, ai_ns)})",
+        "",
         f"Total TSD\n{tele_rev} ({pf(tele_rev, total)})",
-        f"TSD Suspicious\n{tele_susp} ({pf(tele_susp, tele_rev)})",
-        f"TSD Non-Suspicious\n{tele_nsusp} ({pf(tele_nsusp, tele_rev)})",
+        # On-plot text label hidden on request (node/link/flow unchanged,
+        # hover text below still shows the figures) - original label:
+        # f"TSD Suspicious\n{tele_susp} ({pf(tele_susp, tele_rev)})",
+        "",
+        f"TSD Non-Suspicious\n{tele_nsusp} ({pf(tele_nsusp, total)})",
     ]
 
     customdata_nodes = [
         (f"AI Suspicious: {ai_s} ({pf(ai_s, total)} of total screened)<br>"
-         f"TSD High Risk: {high_ai_s} | TSD Low Risk: {low_ai_s}"),
+         f"Tele-Diagnosis High Risk: {high_ai_s} | Tele-Diagnosis Low Risk: {low_ai_s}"),
         (f"AI Non-Suspicious: {ai_ns} ({pf(ai_ns, total)} of total screened)<br>"
-         f"TSD High Risk: {high_ai_ns} | TSD Low Risk: {low_ai_ns}"),
-        f"Pending TSD: {pend} ({pf(pend, total)} of total screened)",
+         f"Tele-Diagnosis High Risk: {high_ai_ns} | Tele-Diagnosis Low Risk: {low_ai_ns}"),
+        f"Pending Tele-Diagnosis: {pend} ({pf(pend, total)} of total screened)",
         f"Not Reviewed: {norev} ({pf(norev, total)} of total screened)",
-        (f"Total TSD: {tele_rev} ({pf(tele_rev, total)} of total screened)<br>"
+        (f"Total Tele-Diagnosis: {tele_rev} ({pf(tele_rev, total)} of total screened)<br>"
          f"From AI-Suspicious: {tr_s} ({pf(tr_s, ai_s)}) | From AI-Non-Suspicious: {tr_ns} ({pf(tr_ns, ai_ns)})"),
-        (f"TSD Suspicious: {tele_susp} ({pf(tele_susp, total)} of total screened)<br>"
+        (f"Tele-Diagnosis Suspicious: {tele_susp} ({pf(tele_susp, total)} of total screened)<br>"
          f"High Risk: {high} ({pf(high, total)}) | Low Risk: {low} ({pf(low, total)})<br>"
-         f"TSD from AI Suspicious: {susp_from_ai_s} ({pf(susp_from_ai_s, ai_s)}) | TSD from AI Non-Suspicious: {susp_from_ai_ns} ({pf(susp_from_ai_ns, ai_ns)})<br>"
+         f"Tele-Diagnosis from AI Suspicious: {susp_from_ai_s} ({pf(susp_from_ai_s, ai_s)}) | Tele-Diagnosis from AI Non-Suspicious: {susp_from_ai_ns} ({pf(susp_from_ai_ns, ai_ns)})<br>"
          f"From AI-Suspicious path: High {high_ai_s}, Low {low_ai_s}<br>"
          f"From AI-Non-Suspicious path: High {high_ai_ns}, Low {low_ai_ns}"),
-        (f"TSD Non-Suspicious: {tele_nsusp} ({pf(tele_nsusp, total)} of total screened)<br>"
-         f"TSD from AI Suspicious: {nsusp_from_ai_s} ({pf(nsusp_from_ai_s, ai_s)}) | TSD from AI Non-Suspicious: {nsusp_from_ai_ns} ({pf(nsusp_from_ai_ns, ai_ns)})"),
+        (f"Tele-Diagnosis Non-Suspicious: {tele_nsusp} ({pf(tele_nsusp, total)} of total screened)<br>"
+         f"Tele-Diagnosis from AI Suspicious: {nsusp_from_ai_s} ({pf(nsusp_from_ai_s, ai_s)}) | Tele-Diagnosis from AI Non-Suspicious: {nsusp_from_ai_ns} ({pf(nsusp_from_ai_ns, ai_ns)})"),
     ]
 
     node_colors = [
         AMBER_HIGH, "#484848", "#c8c8c8", "#e0e0e0",
         "#c87d18", AMBER_HIGH, "#484848",
     ]
-    node_x = [0.01, 0.01, 0.25, 0.25, 0.52, 0.76, 0.76]
+    # x=0.01 for the leftmost column left Plotly no room to place those
+    # nodes' labels, so it drew them overlapping the node/link area
+    # (e.g. "AI Non-Suspicious" text ran under the next column's node).
+    # Index 3 (hidden "Not Reviewed" node, paired with AI Non-Suspicious)
+    # is pulled further right than index 2 (Pending TSD) — index 2 sits
+    # close to the big AI-Suspicious → Total TSD ribbon, so pushing it
+    # out that far made its own label run into that ribbon instead.
+    node_x = [0.06, 0.06, 0.28, 0.40, 0.60, 0.77, 0.77]
     node_y = [0.18, 0.68, 0.45, 0.80, 0.34, 0.10, 0.64]
 
     links = []
@@ -1450,8 +1489,12 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
              f"From AI-Suspicious path: {low_ai_s} ({pf(low_ai_s, ai_s)}) | From AI-Non-Suspicious path: {low_ai_ns} ({pf(low_ai_ns, ai_ns)})"),
         ])
         node_colors.extend(["#D94040", AMBER_LOW])
-        node_x.extend([0.985, 0.985])
-        node_y.extend([0.04, 0.16])
+        node_x.extend([1.08, 1.08])
+        # High Risk pinned well below the other nodes' minimum (-0.10,
+        # not 0.04) so after rescaling it still lands at safe_low while
+        # Low Risk ends up much further from it — otherwise the two
+        # labels sit close enough to overlap.
+        node_y.extend([-0.10, 0.16])
         _add_link(5, risk_start,     high, "rgba(217,64,64,1)")
         _add_link(5, risk_start + 1, low,  "rgba(247,197,72,0.40)")
     elif high > 0:
@@ -1461,7 +1504,7 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
             f"From AI-Suspicious path: {high_ai_s} ({pf(high_ai_s, ai_s)}) | From AI-Non-Suspicious path: {high_ai_ns} ({pf(high_ai_ns, ai_ns)})"
         )
         node_colors.append("#D94040")
-        node_x.append(0.985)
+        node_x.append(1.08)
         node_y.append(0.10)
         _add_link(5, risk_start, high, "rgba(217,64,64,0.32)")
     elif low > 0:
@@ -1471,14 +1514,17 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
             f"From AI-Suspicious path: {low_ai_s} ({pf(low_ai_s, ai_s)}) | From AI-Non-Suspicious path: {low_ai_ns} ({pf(low_ai_ns, ai_ns)})"
         )
         node_colors.append(AMBER_LOW)
-        node_x.append(0.985)
+        node_x.append(1.08)
         node_y.append(0.10)
         _add_link(5, risk_start, low, "rgba(247,197,72,0.40)")
 
-    # Rescale node y-positions into a safe canvas band.
+    # Rescale node y-positions into a safe canvas band. safe_low is
+    # lower than safe_high's inset so the topmost node (High Risk) sits
+    # higher up and clears more space from the node below it (Low Risk /
+    # Tele-Diagnosis Non-Suspicious) instead of the two labels colliding.
     if node_y:
         y_min, y_max = min(node_y), max(node_y)
-        safe_low, safe_high = 0.14, 0.90
+        safe_low, safe_high = 0.05, 0.90
         if y_max > y_min:
             span   = y_max - y_min
             node_y = [safe_low + ((y - y_min) / span) * (safe_high - safe_low) for y in node_y]
@@ -1503,17 +1549,38 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
     tgts_f = [remap[t] for t in tgts]
     pcts_f = list(pcts)
 
-    fig_height = plot_height_from_width(sw)
-    top_mg     = 28
-    bot_mg     = max(130, int(fig_height * 0.11))
+    # Ribbon width is proportional to value, so tiny flows like "High
+    # Risk" (6, next to Low Risk's 57) render as a hairline. Give
+    # rendering a floor of 2.5% of total so small flows stay visible as
+    # a solid ribbon — hover/labels still show the true count/pct via
+    # customdata below, only the drawn width is floored.
+    vals_f = [max(v, total * 0.025) if total else v for v in vals]
+    link_customdata = np.stack([list(vals), pcts_f], axis=-1)
+
+    # +80 so the actual node/link plot area (fig_height - top_mg - bot_mg)
+    # comes out close to the registrations chart's plot area
+    # (plot_height_from_width(sw) - 10 - 70), instead of being squeezed
+    # by this figure's much larger top/bottom margins.
+    fig_height = plot_height_from_width(sw) + 80
+    # Extra headroom so the topmost node's (High Risk) label has clear
+    # space above it instead of running off the top edge. Extra footroom
+    # (well past the 130/11% floor) for the "TSD = ..." footnote below
+    # the diagram, clear of the "AI Non-Suspicious" link ribbon that
+    # runs close to the bottom.
+    top_mg     = 40
+    bot_mg     = max(130, int(fig_height * 0.11)) + 70
 
     fig = go.Figure(go.Sankey(
         arrangement="fixed",
         domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
         node=dict(
             pad=12,
-            thickness=18,
-            line=dict(color="rgba(0,0,0,0)", width=0),
+            # Thicker bar (26 vs 18) so small-value nodes like "High
+            # Risk" still read as a solid block instead of a hairline —
+            # this widens the bar itself, not the value-proportional
+            # link ribbons, so it doesn't misrepresent the numbers.
+            thickness=26,
+            line=dict(color="rgba(0,0,0,0.25)", width=1),
             label=labels_f,
             customdata=customdata_nodes_f,
             color=node_colors_f,
@@ -1524,14 +1591,14 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
         link=dict(
             source=srcs_f,
             target=tgts_f,
-            value=list(vals),
-            customdata=pcts_f,
+            value=vals_f,
+            customdata=link_customdata,
             color=list(clrs),
             label=link_labels,
             hovertemplate=(
                 "From: %{source.customdata}<br>"
                 "→ To: %{target.customdata}<br>"
-                "Count: %{value:,} (%{customdata:.1f}% of total screened)<extra></extra>"
+                "Count: %{customdata[0]:,} (%{customdata[1]:.1f}% of total screened)<extra></extra>"
             ),
         ),
     ))
@@ -1540,8 +1607,29 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
         plot_bgcolor="white",
         paper_bgcolor="white",
         height=fig_height,
-        margin=dict(t=top_mg, b=bot_mg, l=10, r=24),
+        # r has to fit the longest right-side label, "TSD
+        # Non-Suspicious" (column 3, x=0.77), which draws to the right
+        # of its node. Column 4 ("Low Risk"/"High Risk", x=1.08 — past
+        # the domain edge, into this margin) draws its label to the
+        # LEFT of its node instead (Plotly's default for nodes past the
+        # domain midpoint), so pushing it further right just reclaims
+        # dead space instead of running text off the edge.
+        margin=dict(t=top_mg, b=bot_mg, l=10, r=95),
         font=dict(size=11, family="Arial, sans-serif", color="#666666"),
+        # NOTE: for this Sankey-only figure, annotation "paper" y=0 maps
+        # to the bottom of the *trace's domain*, not the bottom of the
+        # whole canvas — margin.b (the space we reserved below the
+        # domain) turned out to start at y=0 and extend to NEGATIVE y,
+        # not positive. y=-0.22 (measured empirically) lands in the
+        # middle of that reserved strip, clear of the domain's own
+        # content (which can bleed a little past its own bottom edge).
+        annotations=[dict(
+            text="TSD = Tele-Specialist Diagnosis",
+            xref="paper", yref="paper",
+            x=0, y=-0.22, xanchor="left", yanchor="bottom",
+            showarrow=False,
+            font=dict(size=10, color="#070707", family="Arial, sans-serif"),
+        )],
     )
     fig.update_traces(
         textfont=dict(color="#666666", size=11, family="Arial, sans-serif"),
@@ -1586,7 +1674,7 @@ def _card_font_sizes(card_w: int, ticker: bool = False) -> tuple[int, int, str, 
     pad_t = round(_interp(card_w, [(160, 7), (460, 10)]))
     pad_b = round(_interp(card_w, [(160, 5), (460, 8)]))
     height = round(_interp(card_w, [
-        (160, 96), (220, 104), (300, 114), (380, 122), (460, 128), (600, 130),
+        (160, 130), (220, 140), (300, 152), (380, 160), (460, 168), (600, 172),
     ]))
     if ticker:
         # The scrolling state-name line sits below the label and needs a
@@ -1607,6 +1695,7 @@ def _animated_metric_card(
     animate: bool = False,
     n_cols: int = 2,
     height_override: int | None = None,
+    card_width: int | None = None,
 ) -> None:
     """Render a metric card; animate count-up only when animate=True.
     `n_cols` is how many st.columns share the row this card is placed in
@@ -1615,7 +1704,10 @@ def _animated_metric_card(
     a specific total card height — pass this when the card shares a row
     with a `_map_stat_card` (which needs extra height for its scrolling
     ticker line) so every card in that row ends up the same height
-    instead of the ticker cards being taller."""
+    instead of the ticker cards being taller. `card_width` overrides the
+    width used for font sizing — pass this when the row's columns are not
+    equal width (see `_weighted_col_width`) instead of the equal n-way
+    split `_row_width(n_cols)` would assume."""
     safe_sub      = html.escape(sub_text)
     safe_dur_text = html.escape(duration_text)
     safe_suffix   = json.dumps(suffix)
@@ -1626,7 +1718,9 @@ def _animated_metric_card(
         if duration_text else ""
     )
 
-    big_font, sub_font, pad, card_height = _card_font_sizes(_row_width(n_cols))
+    big_font, sub_font, pad, card_height = _card_font_sizes(
+        card_width if card_width is not None else _row_width(n_cols)
+    )
     if height_override is not None:
         card_height = height_override
 
@@ -1681,6 +1775,7 @@ def _map_stat_card(
     border_color: str,
     n_cols: int = 4,
     height_override: int | None = None,
+    card_width: int | None = None,
 ) -> None:
     """Animated card with count-up and scrolling state-name ticker.
     `n_cols` is how many st.columns share the row this card is placed in
@@ -1690,13 +1785,16 @@ def _map_stat_card(
     `height_override` forces a specific total card height — pass this
     alongside plain `_animated_metric_card`s in the same row so every card
     in the row ends up the same height instead of just the ticker cards
-    being taller."""
+    being taller. `card_width` overrides the width used for font sizing —
+    pass this when the row's columns are not equal width (see
+    `_weighted_col_width`) instead of the equal n-way split
+    `_row_width(n_cols)` would assume."""
     # Escape content sourced from external JSON to prevent HTML injection.
     safe_label = html.escape(label)
     safe_items = [html.escape(s) for s in items]
     items_str  = " · ".join(safe_items) if safe_items else ""
 
-    card_w = _row_width(n_cols)
+    card_w = card_width if card_width is not None else _row_width(n_cols)
     big_font, sub_font, pad, card_height = _card_font_sizes(card_w, ticker=True)
     if height_override is not None:
         card_height = height_override
@@ -1718,7 +1816,7 @@ def _map_stat_card(
                 body{{background:#fff;font-family:'Segoe UI',Arial,sans-serif;}}
                 .card{{background:#fff;border-radius:14px;padding:{pad};
                     box-shadow:0 2px 16px rgba(0,0,0,.07);border-left:6px solid {border_color};
-                    box-sizing:border-box;height:{card_height}px;margin:8px;
+                    box-sizing:border-box;height:{card_height - 16}px;margin:8px;
                     display:flex;flex-direction:column;justify-content:center;overflow:hidden;}}
                 .bignum{{font-size:{big_font}px;font-weight:800;color:{big_color};line-height:1.1;margin:2px 0;}}
                 .subtext{{font-size:{sub_font}px;font-weight:700;color:#000;margin-top:4px;
@@ -1746,7 +1844,103 @@ def _map_stat_card(
                 }})();
                 </script>
                 </body></html>"""
-    st.iframe(_html, height=card_height + 16)
+    st.iframe(_html, height=card_height)
+
+
+def _phone_deployment_plot_card(
+    deployment_data: "list[dict] | dict",
+    phones_total: int = 0,
+    n_cols: int = 4,
+    height: "int | None" = None,
+    border_color: str = "#0771eb",
+    card_width: int | None = None,
+) -> None:
+    """Card showing the total phones deployed plus their breakdown by
+    period as a horizontal bar plot, styled as the same
+    rounded/shadowed/left-accented HTML card as `_animated_metric_card` /
+    `_map_stat_card` (rather than a Streamlit-native container + Plotly
+    chart, which render with different corners/shadow/background and
+    don't visually match the other cards in the row). `n_cols`/`height`
+    follow the same sizing convention as the other cards so the whole row
+    lines up. `card_width` overrides the width used for font sizing —
+    pass this when the row's columns are not equal width (see
+    `_weighted_col_width`).
+
+    Labels wrap onto a second line rather than truncating with an
+    ellipsis on the first available line — truncation (via line-clamp)
+    is only a last-resort fallback if a label still doesn't fit after
+    wrapping, which combined with the extra column width the row gives
+    this card (see `_tab_overall`) should only bite at the very narrowest
+    screen widths."""
+    card_w = card_width if card_width is not None else _row_width(n_cols)
+    big_font, sub_font, pad, card_height = _card_font_sizes(card_w)
+    if height is not None:
+        card_height = height
+
+    d = deployment_data[0] if isinstance(deployment_data, list) else deployment_data
+    labels: list[str] = []
+    values: list[int] = []
+    if d:
+        try:
+            labels = [str(k) for k in d.keys()]
+            values = [int(v) for v in d.values()]
+        except (TypeError, ValueError):
+            labels, values = [], []
+
+    bar_font = round(_interp(card_w, [(160, 10), (300, 12), (460, 13)]))
+    label_font = round(_interp(card_w, [(160, 10), (300, 10), (460, 14)]))
+    max_v = max(values) if values else 1
+
+    rows_html = ""
+    for lbl, val in zip(labels, values):
+        pct = round(val / max_v * 100, 1) if max_v else 0
+        rows_html += (
+            '<div class="bar-row">'
+            f'<div class="bar-label">{html.escape(lbl)}</div>'
+            '<div class="bar-track">'
+            f'<div class="bar-fill" style="width:{pct}%;"></div>'
+            '</div>'
+            f'<div class="bar-value">{val:,}</div>'
+            '</div>'
+        )
+    if not rows_html:
+        rows_html = (
+            '<div style="font-size:{0}px;color:#999;">No deployment '
+            'breakdown available.</div>'
+        ).format(sub_font)
+
+    safe_label  = html.escape("🚩 Deployment Sites: ")
+    safe_number = html.escape(f"{phones_total:,}")
+
+    _html = f"""<!DOCTYPE html><html><head><style>
+                html,body{{margin:0;padding:0;overflow:hidden;}}
+                body{{background:#fff;font-family:'Segoe UI',Arial,sans-serif;}}
+                .card{{background:#fff;border-radius:14px;padding:{pad};
+                    box-shadow:0 2px 16px rgba(0,0,0,.07);border-left:6px solid {border_color};
+                    box-sizing:border-box;height:{card_height - 16}px;margin:8px;
+                    display:flex;flex-direction:column;justify-content:center;overflow:hidden;}}
+                .cardtitle{{font-size:{sub_font}px;font-weight:700;color:#000;margin-bottom:6px;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;
+                    align-items:baseline;flex-shrink:0;}}
+                .cardnumber{{font-size:{big_font}px;font-weight:800;color:#E0730B;margin-left:2px;}}
+                .bar-row{{display:flex;align-items:center;margin:5px 0;flex-shrink:0;}}
+                .bar-label{{flex:0 0 44%;max-width:44%;font-size:{label_font}px;color:#000;
+                    font-weight:700;white-space:normal;overflow-wrap:break-word;line-height:1.2;
+                    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+                    overflow:hidden;padding-right:6px;box-sizing:border-box;}}
+                .bar-track{{flex:1;min-width:32px;height:16px;border-radius:3px;overflow:hidden;
+                    align-self:center;}}
+                .bar-fill{{background:{border_color};height:100%;border-radius:3px;}}
+                .bar-value{{margin-left:8px;font-size:{bar_font}px;font-weight:700;
+                    color:{border_color};white-space:nowrap;min-width:24px;text-align:right;
+                    align-self:center;}}
+                </style></head><body>
+                <div class="card">
+                <div class="cardtitle">{safe_label}<span class="cardnumber">{safe_number}</span></div>
+                {rows_html}
+                </div>
+                </body></html>"""
+    st.iframe(_html, height=card_height)
 
 
 @st.cache_data(max_entries=12, ttl=3600, show_spinner=False)
@@ -1842,10 +2036,6 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
     # ── Site pins from map_data ──────────────────────────────────────
     map_sites = map_data.get("map_sites", [])
 
-    _PIN_COLORS = {
-        "district_sentinel": {"ongoing": "#b61ff7", "upcoming": "#b61ff7"},
-        "sentinel":          {"ongoing": "#2980B9", "upcoming": "#2980B9"},
-    }
     _PIN_LABELS = {
         "district_sentinel": "District Level Deployment and Sentinel Site",
         "sentinel":          "Sentinel Site",
@@ -1853,49 +2043,57 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
 
     # Per-site text position overrides to avoid label collisions
     _TEXT_POS = {
-        "West Bengal":           "top right",
-        "Kolkata":               "bottom right",
+        "West Bengal":           "top center",
+        "Kolkata":               "middle right",
         "Mathura":               "middle right",
         "Kohima":                "middle right",
         "Goa":                   "middle right",
         "Thanjavur":             "middle right",
-        "Delhi":                 "top left",
+        "Delhi":                 "top center",
         "Varanasi":              "middle right",
         "Silchar":               "middle right",
         "Guwahati":              "top center",
-        "Bangalore":             "middle right",
+        "KLE":                   "top center",
+        "MSMF":                  "middle right",
+        "Anekal":                "middle left",
     }
 
     # Subsite font colors by status — green for ongoing, yellow for
-    # upcoming, red for stopped.
+    # upcoming.
     _SUBSITE_COLORS = {
         "ongoing":  "#1CBD1C",
         "upcoming": "#C08909",
-        "stopped":   "#D93025",
     }
 
+    def _shown(d: dict) -> bool:
+        """True if this site/subsite's map_show flag is 'yes' (case-
+        insensitive). Only status='...' == 'no' items are excluded by
+        this flag - `status` itself (ongoing/upcoming) does not affect
+        whether something is plotted, only its color once it's on the map."""
+        return str(d.get("map_show", "")).strip().lower() == "yes"
+
     for site_type, label in _PIN_LABELS.items():
-        sites = [s for s in map_sites if s.get("type") == site_type]
+        sites = [
+            s for s in map_sites
+            if s.get("type") == site_type and _shown(s)
+        ]
         if not sites:
             continue
-        color = "#b61ff7" if site_type == "district_sentinel" else "#2980B9"
+        base_color = "#b61ff7" if site_type == "district_sentinel" else "#2980B9"
 
         # Add each site as a separate trace so textposition can vary per pin
         for i, s in enumerate(sites):
             name = s.get("name", "")
             tpos = _TEXT_POS.get(name, "middle right")
+            color = base_color
 
-            # Hover text: site name, then ALL subsites listed indented on
-            # their own line below it, font-colored by status (green =
-            # ongoing, yellow = upcoming, red = stopped). Stopped subsites
-            # are always sorted to the bottom of the list; sort is stable
-            # so relative order within each group is preserved.
-            all_subs = sorted(
-                s.get("subsites", []),
-                key=lambda sub: 1 if sub.get("status") == "stopped" else 0,
-            )
+            # Hover text: site name, then only the subsites with
+            # map_show == "yes", listed indented on their own line below
+            # it, font-colored by status (green = ongoing, yellow =
+            # upcoming).
+            shown_subs = [sub for sub in s.get("subsites", []) if _shown(sub)]
             hover_lines = [f"<b>{html.escape(name)}</b>"]
-            for sub in all_subs:
+            for sub in shown_subs:
                 sub_name   = sub.get("name", "")
                 sub_status = sub.get("status", "")
                 sub_color  = _SUBSITE_COLORS.get(sub_status, "#484848")
@@ -1943,9 +2141,7 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
                 '<span style="color:#64E64A;font-size:15px;">■</span>'
                 '<span style="font-size:11px;"> Ongoing &nbsp;</span>'
                 '<span style="color:#F4CA67;font-size:15px;">■</span>'
-                '<span style="font-size:11px;"> Upcoming &nbsp;</span>'
-                '<span style="color:#dfe0ea;font-size:15px;">■</span>'
-                '<span style="font-size:11px;"> Not Covered</span>'
+                '<span style="font-size:11px;"> Upcoming</span>'
                 '<br>'
                 '<span style="color:#b61ff7;font-size:13px;">⬤</span>'
                 '<span style="font-size:10px;"> District/Sentinel Site &nbsp;</span>'
@@ -1984,12 +2180,6 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
                 '<br>'
                 f'<span style="color:#F4CA67;font-size:{_leg_box}px;">■</span>'
                 f'<span style="font-size:{_leg_text}px;"> Upcoming</span>'
-                '<br>'
-                f'<span style="color:#D93025;font-size:{_leg_box}px;">■</span>'
-                f'<span style="font-size:{_leg_text}px;"> Stopped</span>'
-                '<br>'
-                f'<span style="color:#dfe0ea;font-size:{_leg_box}px;">■</span>'
-                f'<span style="font-size:{_leg_text}px;"> Not Covered</span>'
                 '<br><br>'
                 f'<span style="color:#b61ff7;font-size:{_leg_dot}px;">⬤</span>'
                 f'<span style="font-size:{_leg_text}px;"> District Level Deployment &amp; Sentinel Site</span>'
@@ -2049,7 +2239,7 @@ def _fig_india_map(df: pd.DataFrame, map_data: dict, width: int = 1200) -> "go.F
 
 @st.fragment
 def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None:
-    """Overall tab — shows combined Phase 1 + Phase 2 statistics."""
+    """Overall tab — shows combined Image-Based Screening + AI-Enabled Screening statistics."""
     if df.empty:
         st.info("No data matches the current filters.")
         return
@@ -2099,8 +2289,26 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         susp_rate = round(total_susp / total_cum * 100, 1) if total_cum else 0
         high_pct  = round(high_total / total_cum * 100, 1) if total_cum else 0
 
+        # Force this card to occupy the same total vertical footprint as
+        # the Total Screened card in col_l (an _animated_metric_card
+        # iframe of height card_height). Left unset, this card's CSS
+        # class (min-height:120px; height:auto) sizes itself off its own
+        # content, so the two cards drift out of alignment.
+        #
+        # Visible box height mirrors the screened card's own inner
+        # `.card` box (card_height - 16, see _animated_metric_card) so
+        # the two look equally "full" instead of this one having huge
+        # top/bottom padding. Streamlit also wraps st.markdown HTML in a
+        # container with its own fixed -16px margin-bottom (measured
+        # empirically; iframes/components don't get this), so the
+        # margin-bottom needed to make the footprints match on screen
+        # is 32, not the class's default 10: (H-16) + 32 - 16 == H.
+        _, _, _, _dualstat_h = _card_font_sizes(_row_width(ov_n))
+        _dualstat_box_h = _dualstat_h - 16
         st.markdown(
-            f'<div class="ocp-card ocp-card-amb ocp-card-dualstat" style="padding:10px 24px 8px;">'
+            f'<div class="ocp-card ocp-card-amb ocp-card-dualstat" '
+            f'style="padding:10px 24px 8px;height:{_dualstat_box_h}px;'
+            f'min-height:{_dualstat_box_h}px;margin-bottom:32px;">'
             f'<div class="card-dualstat-row" style="font-size:35px;">'
             f'<span>Suspicious: {total_susp:,} ({susp_rate}%)</span>'
             f'<span class="dualstat-sep">|</span>'
@@ -2123,26 +2331,52 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
             "<hr style='border:none;border-top:1px solid #eee;margin:8px 0 4px;'>",
             unsafe_allow_html=True,
         )
-        phones     = int(map_data.get("phones_deployed",    0))
-        fhw        = int(map_data.get("fhw_trained",        0))
-        ongoing    = map_data.get("ongoing_states", [])
-        future     = map_data.get("upcoming_states",  [])
+        phones          = int(map_data.get("phones_deployed",    0))
+        fhw             = int(map_data.get("fhw_trained",        0))
+        ongoing         = map_data.get("ongoing_states", [])
+        future          = map_data.get("upcoming_states",  [])
+        deployment_data = map_data.get("deployment_data", [])
 
         mc_n = _cols(4, 3, 1)
-        mc_cols = st.columns(mc_n, gap="small")
-        # Two of these four cards (_map_stat_card) carry a scrolling
-        # state-name ticker line and need a bit more height than the two
-        # plain _animated_metric_cards — left to size themselves
-        # independently, that height difference showed up as the row's
-        # boxes not lining up. Compute one shared height (the taller,
-        # ticker-inclusive variant) up front and force every card in the
-        # row to that height so they stay visually uniform.
-        mc_card_h = _card_font_sizes(_row_width(mc_n), ticker=True)[3]
+
+        # The deployment card's period labels ("April 2026 onwards", etc.)
+        # run longer than the other cards' short titles. Rather than a
+        # fixed guess at how much extra room to give it, size the boost
+        # off the longest actual label and give that column extra
+        # relative width in the row — st.columns() then shrinks the other
+        # columns proportionally to make room, instead of every column
+        # claiming a fixed equal share regardless of what it needs to
+        # display. `_phone_deployment_plot_card`'s own label wrapping (see
+        # its docstring) is the last-resort fallback if a label still
+        # doesn't fit after this redistribution.
+        _dd = deployment_data[0] if isinstance(deployment_data, list) else deployment_data
+        _max_label_len = max((len(str(k)) for k in _dd.keys()), default=0) if _dd else 0
+        _deploy_extra = min(max(_max_label_len - 6, 0) * 0.045, 1.0)
+
+        _deploy_card_idx = 2  # position of the deployment card in mc_cards below
+        _col_weights = [1.0] * mc_n
+        _col_weights[_deploy_card_idx % mc_n] += _deploy_extra
+        mc_cols = st.columns(_col_weights, gap="small")
+
+        def _mc_card_width(card_idx: int) -> int:
+            return _weighted_col_width(_col_weights, card_idx % mc_n)
+
+        # Two of these cards (_map_stat_card) carry a scrolling state-name
+        # ticker line and need a bit more height than the plain
+        # _animated_metric_cards — left to size themselves independently,
+        # that height difference showed up as the row's boxes not lining
+        # up. Compute one shared height (off the narrowest column in the
+        # row — the worst case) up front and force every card in the row
+        # to that height so they stay visually uniform.
+        mc_card_h = _card_font_sizes(
+            min(_weighted_col_width(_col_weights, i) for i in range(mc_n)),
+            ticker=True,
+        )[3]
         mc_cards = [
-            (lambda: _map_stat_card(len(ongoing), "📍Ongoing States/UTs", ongoing, "#237213", "#237113", n_cols=mc_n, height_override=mc_card_h)),
-            (lambda: _animated_metric_card(fhw,        "", "👩‍⚕️ Frontline Health Worker Trained", "", "#0771eb", "#0771eb", animate=True, n_cols=mc_n, height_override=mc_card_h)),
-            (lambda: _animated_metric_card(phones,     "", "📱 Phones Deployed", "", "#0771eb", "#0771eb", animate=True, n_cols=mc_n, height_override=mc_card_h)),
-            (lambda: _map_stat_card(len(future),  "📍 Upcoming States", future,  "#F4CA67", "#F4CA67", n_cols=mc_n, height_override=mc_card_h)),
+            (lambda: _map_stat_card(len(ongoing), "📍Ongoing States/UTs", ongoing, "#237213", "#237113", height_override=mc_card_h, card_width=_mc_card_width(0))),
+            (lambda: _animated_metric_card(fhw,        "", "👩‍⚕️ Frontline Health Worker Trained", "", "#0771eb", "#0771eb", animate=True, height_override=mc_card_h, card_width=_mc_card_width(1))),
+            (lambda: _phone_deployment_plot_card(deployment_data, phones_total=phones, height=mc_card_h, card_width=_mc_card_width(2))),
+            (lambda: _map_stat_card(len(future),  "📍 Upcoming States", future,  "#F4CA67", "#F4CA67", height_override=mc_card_h, card_width=_mc_card_width(3))),
         ]
         for i, card_fn in enumerate(mc_cards):
             with mc_cols[i % mc_n]:
@@ -2191,7 +2425,7 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
     # Site | Screened | Suspicious | High risk — % taken row-wise against
     # that site's total screened (same colours as the summary cards
     # above: green for screened, amber for suspicious, red for high risk).
-    if "site_id" in df.columns:
+    if "site_full_id" in df.columns:
         id_col = _id_col(df)
         reviewed_mask, suspicious_mask, _, _ = _choose_status_masks(df, phase="phase1")
         high_mask = (
@@ -2200,29 +2434,32 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
             else pd.Series(False, index=df.index)
         )
 
-        site_key = df["site_id"].astype(str)
+        site_key = df["site_full_id"].astype(str)
         screened_by_site   = df.groupby(site_key)[id_col].nunique()
         suspicious_by_site = suspicious_mask.groupby(site_key).sum()
         high_by_site        = high_mask.groupby(site_key).sum()
 
-        if "states" in df.columns:
-            state_by_site = df.groupby(site_key)["states"].agg(
+        if "study_site_id" in df.columns:
+            site_type_by_site = df.groupby(site_key)["study_site_id"].agg(
                 lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
             )
         else:
-            state_by_site = pd.Series(dtype=object)
+            site_type_by_site = pd.Series(dtype=object)
 
         if "date_of_case_registered" in df.columns:
             min_date_by_site = df.groupby(site_key)["date_of_case_registered"].min()
-            max_date_by_site = df.groupby(site_key)["date_of_case_registered"].max()
         else:
             min_date_by_site = pd.Series(dtype="datetime64[ns]")
-            max_date_by_site = pd.Series(dtype="datetime64[ns]")
 
-        sites_present = (
-            [s for s in SITE_ORDER if s in screened_by_site.index]
-            + sorted(set(screened_by_site.index) - set(SITE_ORDER))
-        )
+        # Group by site type — District rows first, then Hospital rows
+        # (anything else/unlabeled sorts last) — and within each group,
+        # highest Screened count first.
+        def _site_sort_key(site: str) -> tuple[int, int]:
+            st_type = str(site_type_by_site.get(site, "") or "").strip().lower()
+            group = 0 if st_type == "district" else (1 if st_type == "hospital" else 2)
+            return (group, -int(screened_by_site.get(site, 0)))
+
+        sites_present = sorted(screened_by_site.index, key=_site_sort_key)
 
         if sites_present:
             rows_html = []
@@ -2232,25 +2469,26 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 high     = int(high_by_site.get(site, 0))
                 susp_pct = round(susp / screened * 100, 1) if screened else 0.0
                 high_pct = round(high / screened * 100, 1) if screened else 0.0
-                state_str = str(state_by_site.get(site, "") or "—")
+                site_type_str = str(site_type_by_site.get(site, "") or "—")
+                _site_type_lower = site_type_str.strip().lower()
+                if _site_type_lower == "district":
+                    site_type_color = "#0BB8E8"   # matches District marker colour on the map
+                elif _site_type_lower == "hospital":
+                    site_type_color = "#7A2DE4"   # matches Sentinel/Hospital marker colour on the map
+                else:
+                    site_type_color = "#555"
 
                 min_dt = min_date_by_site.get(site)
-                max_dt = max_date_by_site.get(site)
-                if pd.notna(min_dt) and pd.notna(max_dt):
-                    duration_str = (
-                        f"{min_dt.strftime('%d-%b-%Y')} to {max_dt.strftime('%d-%b-%Y')}"
-                    )
-                else:
-                    duration_str = "—"
+                start_date_str = min_dt.strftime('%d-%b-%Y') if pd.notna(min_dt) else "—"
 
                 rows_html.append(
                     "<tr>"
                     f"<td style='padding:5px 10px;text-align:left;font-weight:600;"
                     f"color:#333;border-top:1px solid #eee;'>{html.escape(site)}</td>"
+                    f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
+                    f"color:{site_type_color};border-top:1px solid #eee;white-space:nowrap;'>{html.escape(site_type_str)}</td>"
                     f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
-                    f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(state_str)}</td>"
-                    f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
-                    f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(duration_str)}</td>"
+                    f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(start_date_str)}</td>"
                     f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
                     f"color:#228B22;border-top:1px solid #eee;'>{screened:,}</td>"
                     f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
@@ -2270,10 +2508,10 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 "color:#555;'>Sites</th>"
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-                "color:#555;'>State</th>"
+                "color:#555;'>Site Type</th>"
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-                "color:#555;'>Duration</th>"
+                "color:#555;'>Start Date</th>"
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
                 "color:#228B22;'>Screened</th>"
@@ -2289,10 +2527,24 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
             st.markdown(
                 "<hr style='border:none;border-top:1px solid #eee;margin:18px 0 10px;'>"
                 "<div style='font-weight:700;font-size:25px;color:#333;"
-                "margin-bottom:8px;'>🏥 Site-wise Summary</div>",
+                "margin-bottom:8px;'>🏥 Summary</div>",
                 unsafe_allow_html=True,
             )
             st.markdown(table_html, unsafe_allow_html=True)
+
+            footnote_text = str(map_data.get("footnote", "") or "").strip()
+            if footnote_text:
+                # footnote lines are '*'-prefixed and separated by literal
+                # \n in the JSON; render each on its own line under the table.
+                footnote_lines = [
+                    line.strip() for line in footnote_text.split("\n") if line.strip()
+                ]
+                footnote_html = "<br>".join(html.escape(line) for line in footnote_lines)
+                st.markdown(
+                    f"<div style='margin-top:6px;font-size:12px;color:#888;"
+                    f"font-style:italic;line-height:1.5;'>{footnote_html}</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 @st.fragment
@@ -2346,8 +2598,16 @@ def _tab_phase1(df: pd.DataFrame) -> None:
         susp_rate = round(total_susp / total_cum * 100, 1) if total_cum else 0
         high_pct  = round(high_total / total_cum * 100, 1) if total_cum else 0
 
+        # Force this card to occupy the same total vertical footprint as
+        # the Total Screened card in col_l — see _tab_overall for why the
+        # box height mirrors card_height - 16 with an explicit 32px
+        # margin-bottom, rather than the class's default 10.
+        _, _, _, _dualstat_h = _card_font_sizes(_row_width(p1_n))
+        _dualstat_box_h = _dualstat_h - 16
         st.markdown(
-            f'<div class="ocp-card ocp-card-amb ocp-card-dualstat" style="padding:10px 24px 8px;">'
+            f'<div class="ocp-card ocp-card-amb ocp-card-dualstat" '
+            f'style="padding:10px 24px 8px;height:{_dualstat_box_h}px;'
+            f'min-height:{_dualstat_box_h}px;margin-bottom:32px;">'
             f'<div class="card-dualstat-row" style="font-size:35px;">'
             f'<span>Suspicious: {total_susp:,} ({susp_rate}%)</span>'
             f'<span class="dualstat-sep">|</span>'
@@ -2466,8 +2726,8 @@ def main() -> None:
 
     # ── Live sites ───────────────────────────────────────────────────
     live_in_data: set[str] = set()
-    if "site_id" in df_raw.columns:
-        live_in_data.update(df_raw["site_id"].dropna().astype(str).unique().tolist())
+    if "site_full_id" in df_raw.columns:
+        live_in_data.update(df_raw["site_full_id"].dropna().astype(str).unique().tolist())
     live_sites = [s for s in SITE_ORDER if s in live_in_data] + sorted(live_in_data - set(SITE_ORDER))
 
     # ════════════════════════════════════════════════════════════════
@@ -2622,6 +2882,7 @@ def main() -> None:
             value=(min_dt, max_dt),
             min_value=min_dt,
             max_value=max_dt,
+            format="DD/MM/YYYY",
             key=f"dr_{_f}",
         )
         if isinstance(dr, tuple) and len(dr) == 2:
@@ -2674,8 +2935,8 @@ def main() -> None:
     # ════════════════════════════════════════════════════════════════
     # Apply filters — produce three filtered views
     #   df_all : all phases combined (Overall tab)
-    #   df_p1  : phase == '1'        (Phase 1 tab)
-    #   df_p2  : phase == '2'        (Phase 2 tab)
+    #   df_p1  : phase == '1'        (Image-Based Screening tab)
+    #   df_p2  : phase == '2'        (AI-Enabled Screening tab)
     # ════════════════════════════════════════════════════════════════
 
     df_all = df_raw[date_mask].copy()
@@ -2702,10 +2963,10 @@ def main() -> None:
     df_all_map = df_all.copy()
 
     # Site filter
-    if site_sel != "All" and "site_id" in df_all.columns:
+    if site_sel != "All" and "site_full_id" in df_all.columns:
         for _df in (df_all, df_p1, df_p2):
-            if "site_id" in _df.columns:
-                _df.drop(_df.index[_df["site_id"].astype(str) != site_sel], inplace=True)
+            if "site_full_id" in _df.columns:
+                _df.drop(_df.index[_df["site_full_id"].astype(str) != site_sel], inplace=True)
 
     # ════════════════════════════════════════════════════════════════
     # Research Dashboard — Coming Soon
@@ -2730,7 +2991,7 @@ def main() -> None:
         return
 
     # ════════════════════════════════════════════════════════════════
-    # Tab Navigation  —  Overall · Phase 1 · Phase 2
+    # Tab Navigation  —  Overall · Image-Based Screening · AI-Enabled Screening
     # ════════════════════════════════════════════════════════════════
 
     if "tab" not in st.session_state:
@@ -2753,7 +3014,7 @@ def main() -> None:
 
     with tc2:
         if st.button(
-            "Phase 1",
+            "Image-Based Screening",
             key="btn_p1",
             type="primary" if st.session_state.tab == 1 else "secondary",
             width="stretch",
@@ -2763,7 +3024,7 @@ def main() -> None:
 
     with tc3:
         if st.button(
-            "Phase 2",
+            "AI-Enabled Screening",
             key="btn_p2",
             type="primary" if st.session_state.tab == 2 else "secondary",
             width="stretch",
