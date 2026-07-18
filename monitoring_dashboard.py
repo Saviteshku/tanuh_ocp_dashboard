@@ -1961,9 +1961,7 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 "color:#555;'>Start Date</th>"
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-                f"color:#4CA64C;'>Current Month Screened<br>"
-                f"<span style='font-size:10px;font-weight:600;text-transform:none;"
-                f"letter-spacing:normal;color:#999;'>({html.escape(last_lbl)})</span></th>"
+                f"color:#4CA64C;'>Screened in<br>{html.escape(last_lbl)}"
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
                 "color:#228B22;'>Total Screened</th>"
@@ -2135,6 +2133,7 @@ def _tab_phase2(df: pd.DataFrame) -> None:
     last_n_screened = int(mon.iloc[-1]["total"])
     last_susp_rate  = round(last_ai_susp / last_n_screened * 100, 1) if last_n_screened else 0
 
+    
     with col_r:
         _animated_metric_card(
             value=ai_s_tot,
@@ -2142,7 +2141,9 @@ def _tab_phase2(df: pd.DataFrame) -> None:
             pct_value=ai_susp_rate_r,
             sub_text=(
                 f"{last_ai_susp:,} suspicious in {last_lbl}"
-                '<br><span style="font-size:smaller; color:#888; font-style:italic;">(TSD = Tele-Specialist Diagnosis)</span>'
+                '<br><span style="font-size:11px; font-weight:500; color:#888888; font-style:italic;">'
+                '(TSD = Tele-Specialist Diagnosis)'
+                '</span>'
             ),
             duration_text="",
             big_color="#F4A900",
