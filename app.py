@@ -468,7 +468,7 @@ button[kind="secondary"],
 # Bumps Plotly font sizes on any chart the user expands with Streamlit's
 # native chart fullscreen button, and puts them back on exit.
 #
-# HOW THIS WORKS: st.components.v1.html renders inside a same-origin
+# HOW THIS WORKS: st.iframe renders inside a same-origin
 # iframe, so `window.parent.document` reaches the real app DOM. We
 # listen for the browser Fullscreen API's `fullscreenchange` event
 # (which is what Streamlit's chart-expand button triggers) and, when
@@ -834,7 +834,7 @@ def _date_window_mask(
 
 def main() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
-    st.components.v1.html(_FULLSCREEN_FONT_JS, height=0)
+    st.iframe(_FULLSCREEN_FONT_JS, height=1)
 
     # ── Load sibling dashboard modules (re-checked every rerun so a
     #    deleted/restored .py file takes effect immediately, no server
@@ -1108,7 +1108,7 @@ def main() -> None:
         if research_dashboard is None:
             _render_coming_soon("Research Dashboard")
         else:
-            research_dashboard.render(df_p2)
+            research_dashboard.render(df_all, df_p1, df_p2)
         st.markdown("---")
         st.markdown(
             '<div style="text-align:center;padding:10px 0;font-size:12px;color:#c0c0c0;">'
