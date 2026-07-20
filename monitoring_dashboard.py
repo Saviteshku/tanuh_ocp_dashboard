@@ -1878,6 +1878,19 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         else:
             min_date_by_site = pd.Series(dtype="datetime64[ns]")
 
+        # Exact map-JSON name per site (written by merge_data.py from
+        # config.MAP_JSON_NAME_OVERRIDE) — lets stopped-status lookup use
+        # an exact match instead of guessing via substring matching
+        # against the display name, which silently misses cases like
+        # "Goa Dental College & Hospital, Goa" (table) vs. "Goa Dental
+        # College & Hospital (Sentinel Site)" (map JSON).
+        if "map_site_name" in df.columns:
+            map_name_by_site = df.groupby(site_key)["map_site_name"].agg(
+                lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
+            )
+        else:
+            map_name_by_site = pd.Series(dtype=object)
+
         # Group by site type — District rows first, then Hospital rows
         # (anything else/unlabeled sorts last) — and within each group,
         # highest Screened count first.
@@ -1890,12 +1903,25 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
 
         if sites_present:
             # ---- Build stopped sites set from map_data ----
+            # Walks both top-level sites and their subsites — a site can be
+            # "stopped" at either level (e.g. Krishnagiri is stopped at the
+            # top level, while Goa Dental College & Hospital is stopped only
+            # as a subsite under an otherwise-ongoing "Goa" parent).
             stopped_names = set()
             for msite in map_data.get("map_sites", []):
                 if msite.get("status") == "stopped":
                     stopped_names.add(msite["name"].strip().lower())
+                for sub in msite.get("subsites", []):
+                    if sub.get("status") == "stopped":
+                        stopped_names.add(sub["name"].strip().lower())
 
             def is_stopped(site_name: str) -> bool:
+                # Prefer the exact map_site_name bridge column; fall back
+                # to the old fuzzy substring match only for parquet files
+                # produced before this column existed.
+                map_name = str(map_name_by_site.get(site_name, "") or "").strip().lower()
+                if map_name:
+                    return map_name in stopped_names
                 site_lower = site_name.strip().lower()
                 return any(stopped_name in site_lower for stopped_name in stopped_names)
 
