@@ -1849,23 +1849,6 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
         suspicious_by_site = suspicious_mask.groupby(site_key).sum()
         high_by_site        = high_mask.groupby(site_key).sum()
 
-        # Current-month screened, per site — same month bucket (the
-        # last "ym" row of `mon`) as the current-month figure already
-        # shown in the "X screened in <month>" card and used as the
-        # last bar of the registrations plot above.
-        if "date_of_case_registered" in df.columns and not mon.empty:
-            current_ym = mon["ym"].iloc[-1]
-            _cur_mask = (
-                df["date_of_case_registered"].dt.to_period("M") == current_ym
-            )
-            cur_month_by_site = (
-                df.loc[_cur_mask]
-                .groupby(site_key[_cur_mask])[id_col]
-                .nunique()
-            )
-        else:
-            cur_month_by_site = pd.Series(dtype=int)
-
         if "study_site_id" in df.columns:
             site_type_by_site = df.groupby(site_key)["study_site_id"].agg(
                 lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
@@ -1928,17 +1911,10 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
             rows_html = []
             for site in sites_present:
                 screened     = int(screened_by_site.get(site, 0))
-                cur_screened = int(cur_month_by_site.get(site, 0))
                 susp     = int(suspicious_by_site.get(site, 0))
                 high     = int(high_by_site.get(site, 0))
                 susp_pct = round(susp / screened * 100, 1) if screened else 0.0
                 high_pct = round(high / screened * 100, 1) if screened else 0.0
-
-                # ---- Check if site is stopped ----
-                if is_stopped(site):
-                    cur_screened_display = "–"
-                else:
-                    cur_screened_display = f"{cur_screened:,}"
 
                 site_type_str = str(site_type_by_site.get(site, "") or "—")
                 _site_type_lower = site_type_str.strip().lower()
@@ -1960,8 +1936,6 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                     f"color:{site_type_color};border-top:1px solid #eee;white-space:nowrap;'>{html.escape(site_type_str)}</td>"
                     f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
                     f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(start_date_str)}</td>"
-                    f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
-                    f"color:#4CA64C;border-top:1px solid #eee;'>{cur_screened_display}</td>"
                     f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
                     f"color:#228B22;border-top:1px solid #eee;'>{screened:,}</td>"
                     f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
@@ -1985,9 +1959,6 @@ def _tab_overall(df: pd.DataFrame, df_map: "pd.DataFrame | None" = None) -> None
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
                 "color:#555;'>Start Date</th>"
-                "<th style='padding:10px 14px;text-align:center;font-size:14px;"
-                "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-                f"color:#4CA64C;'>Screened in<br>{html.escape(last_lbl)}"
                 "<th style='padding:10px 14px;text-align:center;font-size:14px;"
                 "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
                 "color:#228B22;'>Total Screened</th>"

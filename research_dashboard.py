@@ -3,16 +3,10 @@
 RESEARCH DASHBOARD — standalone module
 Aarogya Aarohan / TANUH Oral Cancer Project
 
-Owns everything shown under the top-level "Research Dashboard" view
-(separate from the Monitoring Dashboard's Overall / Image-Based
-Screening / AI-Enabled Screening tabs).
+Single tab ("Descriptive") showing site‑wise summary table with
+the "Screened in <month>" column.
 
-Currently contains:
-  - Site Screening Targets table (Phase 2 / AI-Enabled Screening data)
-
-To add more Research Dashboard content later, add new render_* /
-build_* functions here and call them from render(df_p2) below —
-main app code (code.py) only needs to call research_dashboard.render().
+Uses the same tab‑button style as the Monitoring Dashboard.
 ====================================================================
 """
 
@@ -30,11 +24,6 @@ import streamlit as st
 # ════════════════════════════════════════════════════════════════════
 # Password gate (research_dash_password, read from map_data.json)
 # ════════════════════════════════════════════════════════════════════
-# map_data.json lives alongside the combined parquet in LOCAL_DATA_DIR
-# (same OCP_DATA_DIR resolution app.py uses), and already carries the
-# deployment-stats/map data the Research Dashboard's map view reads —
-# the password lives in that same file under "research_dash_password".
-
 LOCAL_DATA_DIR = Path(
     os.environ.get(
         "OCP_DATA_DIR",
@@ -43,20 +32,11 @@ LOCAL_DATA_DIR = Path(
 )
 MAP_DATA_PATH = LOCAL_DATA_DIR / "map_data.json"
 
-# How long an unlocked Research Dashboard stays unlocked without any
-# interaction before it re-locks itself and asks for the password
-# again. A full page reload also re-locks it: session_state (where the
-# "authed" flag below lives) is per browser-tab WebSocket session and
-# is wiped from scratch on reload, so there's nothing extra to do for
-# that case — it re-locks automatically.
 SESSION_TIMEOUT_SECONDS = 5 * 60
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_map_data(path_str: str) -> dict:
-    """Read map_data.json from disk. Returns {} if missing/unreadable
-    (e.g. not deployed yet), rather than raising, so a missing file
-    fails safe into "password not configured" below."""
     path = Path(path_str)
     if not path.exists():
         return {}
@@ -72,23 +52,11 @@ def _research_dashboard_password() -> str | None:
 
 
 def _check_password() -> bool:
-    """Gate the Research Dashboard behind research_dash_password.
-
-    Returns True once the correct password has been entered for this
-    browser session AND that unlock is still within the 5-minute
-    inactivity window, else renders the password prompt/error and
-    returns False. Every call that returns True also refreshes the
-    "last active" timestamp, so the 5 minutes measures time since the
-    last dashboard interaction/rerun, not just time since login. A
-    full page reload always re-locks, since session_state itself is
-    wiped on reload.
-    """
     authed_at = st.session_state.get("research_dash_authed_at")
     if authed_at is not None:
         if time.time() - authed_at <= SESSION_TIMEOUT_SECONDS:
             st.session_state.research_dash_authed_at = time.time()
             return True
-        # Timed out — clear and fall through to the password prompt.
         del st.session_state["research_dash_authed_at"]
         st.info("Session timed out after 5 minutes of inactivity — please re-enter the password.")
 
@@ -115,40 +83,19 @@ def _check_password() -> bool:
 
 
 # ════════════════════════════════════════════════════════════════════
-# Site Screening Targets (Phase 2 / AI-Enabled Screening only)
+# Helper functions (copied from monitoring_dashboard for independence)
 # ════════════════════════════════════════════════════════════════════
-# Every site gets a flat 2,500 screenings/month rate. For each site:
-#   Months Initial   = months from that site's own Start Date (earliest
-#                       date_of_case_registered in the data) to the
-#                       fixed study completion date, 31-Mar-2027.
-#   Target           = 2,500 x Months Initial
-#   Months Left      = months from TODAY (system clock) to 31-Mar-2027
-#   New Target/Month = (Target - Screened) / Months Left
-#
-# Only sites that actually appear in the phase-2 data are shown. Sites
-# with no phase-2 records yet are intentionally left out of the table
-# (see commented-out list below) rather than shown as empty placeholder
-# rows.
 
-SITE_TARGET_RATE_PER_MONTH = 2500
-STUDY_END_DATE = pd.Timestamp("2027-03-31")
+_BLANK_LIKE = {"", "nan", "none", "-", ".", "na", "n/a", "null"}
 
-# Sites expected in the overall rollout that may not yet have phase-2
-# data. Left here for reference only -- NOT rendered until they show up
-# in df_p2 (site_full_id). Uncomment / extend as sites go live if you
-# want a static population reference alongside them later.
-# PLANNED_SITES_NOT_YET_LIVE = [
-#     "Tamil Nadu",
-#     "Nagaland",
-#     "Mathura",
-#     "West Bengal",
-#     "Guwahati",
-#     "Silchar",
-#     "Varanasi",
-#     "Bangalore",
-#     "Delhi",
-# ]
+def _norm(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.lower()
 
+def _blank_mask(s: pd.Series) -> pd.Series:
+    return s.isna() | _norm(s).isin(_BLANK_LIKE)
+
+def _present_mask(s: pd.Series) -> pd.Series:
+    return ~_blank_mask(s)
 
 def _id_col(df: pd.DataFrame) -> str:
     for c in ("case_id", "Unique_case_ID"):
@@ -156,129 +103,166 @@ def _id_col(df: pd.DataFrame) -> str:
             return c
     return df.columns[0]
 
+def _is_high_risk(series: pd.Series) -> pd.Series:
+    return _norm(series).eq("high risk")
 
-def _normalize_site_name(name: str) -> str:
-    """Lowercase + collapse whitespace, purely for de-duplicating minor
-    formatting variants of the same site name (e.g. extra spaces)."""
-    return " ".join(str(name).strip().lower().split())
+def _reviewed_mask_phase1(df: pd.DataFrame) -> pd.Series:
+    cols = df.columns
+    prov = df["provisional_diagnosis"] if "provisional_diagnosis" in cols else pd.Series(False, index=df.index)
+    susp = df["suspicion"]             if "suspicion" in cols             else pd.Series(False, index=df.index)
+    risk = df["risk"]                  if "risk" in cols                  else pd.Series(False, index=df.index)
+    return _present_mask(prov) & _present_mask(susp) & _present_mask(risk)
 
-
-def _months_between(start: pd.Timestamp, end: pd.Timestamp) -> float:
-    """Fractional months between two timestamps (30.44-day month)."""
-    return (end - start).days / 30.44
-
-
-def build_site_target_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Build the Site / Start Date / Target / Screened / Months Left /
-    New Target-per-Month table, using ONLY phase-2 data (caller must
-    already have filtered df to phase == '2').
-
-    All dates/targets are derived directly from the data:
-    - Start Date  = earliest date_of_case_registered per site, in data.
-    - Target      = 2,500 x months from that Start Date to 31-Mar-2027.
-    - Months Left = months from system "now" to 31-Mar-2027.
-    - New Target/Month = (Target - Screened) / Months Left.
-    Sites with zero phase-2 rows are not included.
-    """
-    if df is None or df.empty or "site_full_id" not in df.columns:
-        return pd.DataFrame()
-
-    id_col = _id_col(df)
-    site_key_norm = df["site_full_id"].astype(str).map(_normalize_site_name)
-
-    screened_by_site = df.groupby(site_key_norm)[id_col].nunique()
-
-    if "date_of_case_registered" in df.columns:
-        start_by_site = df.groupby(site_key_norm)["date_of_case_registered"].min()
+def _choose_status_masks_phase1(df: pd.DataFrame):
+    reviewed_mask = _reviewed_mask_phase1(df)
+    if "suspicion" in df.columns:
+        suspicious_mask = reviewed_mask & _norm(df["suspicion"]).eq("suspicious")
     else:
-        start_by_site = pd.Series(dtype="datetime64[ns]")
-
-    # Keep the original (as-typed-in-data) display label for each
-    # normalized key, so the table shows real site names from the data.
-    display_name_by_norm = (
-        df.groupby(site_key_norm)["site_full_id"]
-        .agg(lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), ""))
-    )
-
-    now = pd.Timestamp.now()
-    months_left = round(max(_months_between(now, STUDY_END_DATE), 0), 2)
-
-    rows = []
-    for key, screened in screened_by_site.items():
-        screened = int(screened)
-        start_dt = start_by_site.get(key)
-        has_start = pd.notna(start_dt)
-
-        if has_start:
-            months_initial = _months_between(start_dt, STUDY_END_DATE)
-            target = round(months_initial * SITE_TARGET_RATE_PER_MONTH)
-        else:
-            target = None
-
-        if target is not None and months_left > 0:
-            new_target_per_month = round((target - screened) / months_left, 1)
-        else:
-            new_target_per_month = None
-
-        display_name = display_name_by_norm.get(key) or key.title()
-
-        rows.append({
-            "Site": display_name,
-            "Start Date": start_dt.strftime("%d-%b-%Y") if has_start else "Not started",
-            "Target": target,
-            "Screened": screened,
-            "Months Left": months_left if has_start else None,
-            "New Target per Month": new_target_per_month,
-        })
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows).sort_values(by="Screened", ascending=False).reset_index(drop=True)
-    return out
+        suspicious_mask = pd.Series(False, index=df.index)
+    return reviewed_mask, suspicious_mask
 
 
-def render_site_target_table(df: pd.DataFrame) -> None:
-    """Render the Phase 2 site-target tracking table as styled HTML,
-    matching the look of the Monitoring Dashboard's Site-wise Summary
-    table."""
-    table = build_site_target_table(df)
-    if table.empty:
+# ════════════════════════════════════════════════════════════════════
+# Main table renderer – includes "Screened in <month>" column
+# ════════════════════════════════════════════════════════════════════
+
+def _render_site_table(df: pd.DataFrame) -> None:
+    """Display the site-wise summary table including the 'Screened in <month>' column."""
+    if df.empty:
+        st.info("No data matches the current filters.")
         return
 
-    def _fmt_num(v):
-        return f"{int(v):,}" if pd.notna(v) else "\u2014"
+    # 1. Current month label and mask
+    if "date_of_case_registered" not in df.columns:
+        st.info("Date column missing.")
+        return
+    dates = df["date_of_case_registered"].dropna()
+    if dates.empty:
+        st.info("No valid dates available.")
+        return
+    max_dt = dates.max()
+    last_lbl = max_dt.strftime("%b %Y")
+    current_month_mask = (
+        (df["date_of_case_registered"].dt.year == max_dt.year) &
+        (df["date_of_case_registered"].dt.month == max_dt.month)
+    )
+
+    # 2. Site-wise aggregates
+    id_col = _id_col(df)
+    reviewed_mask, suspicious_mask = _choose_status_masks_phase1(df)
+    high_mask = (
+        suspicious_mask & _is_high_risk(df["risk"])
+        if "risk" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+
+    if "site_full_id" not in df.columns:
+        st.info("No site information available.")
+        return
+
+    site_key = df["site_full_id"].astype(str)
+
+    screened_by_site = df.groupby(site_key)[id_col].nunique()
+    suspicious_by_site = suspicious_mask.groupby(site_key).sum()
+    high_by_site = high_mask.groupby(site_key).sum()
+
+    cur_month_by_site = (
+        df.loc[current_month_mask]
+        .groupby(site_key[current_month_mask])[id_col]
+        .nunique()
+    )
+
+    if "study_site_id" in df.columns:
+        site_type_by_site = df.groupby(site_key)["study_site_id"].agg(
+            lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
+        )
+    else:
+        site_type_by_site = pd.Series(dtype=object)
+
+    if "date_of_case_registered" in df.columns:
+        min_date_by_site = df.groupby(site_key)["date_of_case_registered"].min()
+    else:
+        min_date_by_site = pd.Series(dtype="datetime64[ns]")
+
+    # map_site_name for stopped status (optional)
+    if "map_site_name" in df.columns:
+        map_name_by_site = df.groupby(site_key)["map_site_name"].agg(
+            lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
+        )
+    else:
+        map_name_by_site = pd.Series(dtype=object)
+
+    # Load map_data for stopped sites
+    map_data = _load_map_data(str(MAP_DATA_PATH))
+    stopped_names = set()
+    for msite in map_data.get("map_sites", []):
+        if msite.get("status") == "stopped":
+            stopped_names.add(msite["name"].strip().lower())
+        for sub in msite.get("subsites", []):
+            if sub.get("status") == "stopped":
+                stopped_names.add(sub["name"].strip().lower())
+
+    def is_stopped(site_name: str) -> bool:
+        map_name = str(map_name_by_site.get(site_name, "") or "").strip().lower()
+        if map_name:
+            return map_name in stopped_names
+        site_lower = site_name.strip().lower()
+        return any(stopped_name in site_lower for stopped_name in stopped_names)
+
+    # Group by site type: District first, then Hospital, then others
+    def _site_sort_key(site: str) -> tuple[int, int]:
+        st_type = str(site_type_by_site.get(site, "") or "").strip().lower()
+        group = 0 if st_type == "district" else (1 if st_type == "hospital" else 2)
+        return (group, -int(screened_by_site.get(site, 0)))
+
+    sites_present = sorted(screened_by_site.index, key=_site_sort_key)
+
+    if not sites_present:
+        st.info("No sites found.")
+        return
 
     rows_html = []
-    for _, r in table.iterrows():
-        target = r["Target"]
-        screened = r["Screened"]
-        pct_html = ""
-        if pd.notna(target) and target:
-            pct = round(screened / target * 100, 1)
-            pct_color = "#228B22" if pct >= 100 else ("#F4A900" if pct >= 50 else "#D94040")
-            pct_html = f"<span style='color:{pct_color};font-weight:700;'> ({pct}%)</span>"
+    for site in sites_present:
+        screened = int(screened_by_site.get(site, 0))
+        susp = int(suspicious_by_site.get(site, 0))
+        high = int(high_by_site.get(site, 0))
+        susp_pct = round(susp / screened * 100, 1) if screened else 0.0
+        high_pct = round(high / screened * 100, 1) if screened else 0.0
 
-        new_target = r["New Target per Month"]
-        new_target_html = _fmt_num(new_target) if pd.notna(new_target) else "\u2014"
+        if is_stopped(site):
+            cur_screened_display = "–"
+        else:
+            cur_screened = int(cur_month_by_site.get(site, 0))
+            cur_screened_display = f"{cur_screened:,}"
 
-        month_rem = r["Months Left"]
-        month_rem_html = f"{month_rem:g}" if pd.notna(month_rem) else "\u2014"
+        site_type_str = str(site_type_by_site.get(site, "") or "—")
+        _st_lower = site_type_str.strip().lower()
+        if _st_lower == "district":
+            site_type_color = "#0BB8E8"
+        elif _st_lower == "hospital":
+            site_type_color = "#7A2DE4"
+        else:
+            site_type_color = "#555"
+
+        min_dt = min_date_by_site.get(site)
+        start_date_str = min_dt.strftime('%d-%b-%Y') if pd.notna(min_dt) else "—"
 
         rows_html.append(
             "<tr>"
             f"<td style='padding:5px 10px;text-align:left;font-weight:600;"
-            f"color:#333;border-top:1px solid #eee;'>{html.escape(str(r['Site']))}</td>"
+            f"color:#333;border-top:1px solid #eee;'>{html.escape(site)}</td>"
+            f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
+            f"color:{site_type_color};border-top:1px solid #eee;white-space:nowrap;'>{html.escape(site_type_str)}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
-            f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(str(r['Start Date']))}</td>"
+            f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(start_date_str)}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
-            f"color:#0771eb;border-top:1px solid #eee;'>{_fmt_num(target)}</td>"
+            f"color:#4CA64C;border-top:1px solid #eee;'>{cur_screened_display}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
-            f"color:#228B22;border-top:1px solid #eee;'>{_fmt_num(screened)}{pct_html}</td>"
-            f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
-            f"color:#555;border-top:1px solid #eee;'>{month_rem_html}</td>"
+            f"color:#228B22;border-top:1px solid #eee;'>{screened:,}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
-            f"color:#7A2DE4;border-top:1px solid #eee;'>{new_target_html}</td>"
+            f"color:#F4A900;border-top:1px solid #eee;'>{susp:,} ({susp_pct}%)</td>"
+            f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
+            f"color:#D94040;border-top:1px solid #eee;'>{high:,} ({high_pct}%)</td>"
             "</tr>"
         )
 
@@ -289,73 +273,113 @@ def render_site_target_table(df: pd.DataFrame) -> None:
         "<thead><tr style='background:#fafafa;'>"
         "<th style='padding:10px 14px;text-align:left;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-        "color:#555;'>Site</th>"
+        "color:#555;'>Sites</th>"
+        "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+        "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+        "color:#555;'>Site Type</th>"
         "<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
         "color:#555;'>Start Date</th>"
+        f"<th style='padding:10px 14px;text-align:center;font-size:14px;"
+        "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+        f"color:#4CA64C;'>Screened in<br>{html.escape(last_lbl)}</th>"
         "<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-        "color:#0771eb;'>Target</th>"
+        "color:#228B22;'>Total Screened</th>"
         "<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-        "color:#228B22;'>Screened</th>"
+        "color:#F4A900;'>Suspicious</th>"
         "<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-        "color:#555;'>Months Left</th>"
-        "<th style='padding:10px 14px;text-align:center;font-size:14px;"
-        "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-        "color:#7A2DE4;'>New Target/Month</th>"
+        "color:#D94040;'>High Risk</th>"
         "</tr></thead><tbody>" + "".join(rows_html) + "</tbody></table></div>"
     )
 
     st.markdown(table_html, unsafe_allow_html=True)
-    st.markdown(
-        "<div style='margin-top:6px;font-size:12px;color:#888;font-style:italic;'>"
-        "Target = 2,500 screenings/month x months from each site's Start Date "
-        "(earliest recorded screening in the data) to study completion on "
-        "31-Mar-2027. Months Left = months from today to 31-Mar-2027. "
-        "New Target/Month is the revised monthly pace needed, given screenings "
-        "so far, to still reach target by the completion date."
-        "</div>",
-        unsafe_allow_html=True,
-    )
+
+    footnote_text = str(map_data.get("footnote", "") or "").strip()
+    if footnote_text:
+        footnote_lines = [line.strip() for line in footnote_text.split("\n") if line.strip()]
+        footnote_html = "<br>".join(html.escape(line) for line in footnote_lines)
+        st.markdown(
+            f"<div style='margin-top:6px;font-size:12px;color:#888;"
+            f"font-style:italic;line-height:1.5;'>{footnote_html}</div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ════════════════════════════════════════════════════════════════════
-# Public entry point — called by code.py's main() when the user is on
-# the "Research Dashboard" top-level view.
+# Public entry point — called by app.py's main()
 # ════════════════════════════════════════════════════════════════════
 
-def render(df_p2: pd.DataFrame) -> None:
-    """Render the full Research Dashboard view.
+def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> None:
+    """
+    Render the Research Dashboard – single "Descriptive" tab with site table.
 
     Parameters
     ----------
-    df_p2 : phase-2 (AI-Enabled Screening) data only, already filtered
-            by the caller's sidebar filters (date range, gender,
-            study setting, site).
+    df_all : combined dataset (all phases), already filtered by sidebar.
+    df_p1  : phase-1 data (not used, kept for signature compatibility).
+    df_p2  : phase-2 data (not used, kept for signature compatibility).
     """
-    st.markdown(
-        '<div style="font-weight:700;font-size:28px;color:#333;'
-        'margin-bottom:12px;">🔬 Research Dashboard</div>',
-        unsafe_allow_html=True,
-    )
-
+    # Password gate
     if not _check_password():
         return
 
-    if df_p2 is None or df_p2.empty:
-        st.info("No AI-Enabled Screening (Phase 2) data available yet for the current filters.")
-        return
-
+    # ── Style the single tab button to match Monitoring Dashboard ──
     st.markdown(
-        "<div style='font-weight:700;font-size:25px;color:#333;"
-        "margin-bottom:8px;'>\U0001f3af Site Screening Targets</div>",
+        """
+        <style>
+        /* Make the research tab button look exactly like the monitoring tabs */
+        .st-key-btn_research_descriptive button {
+            padding: 10px 12px !important;
+            font-size: 22px !important;
+            font-weight: 800 !important;
+            min-height: 0 !important;
+            line-height: 1.3 !important;
+        }
+        .st-key-btn_research_descriptive button * {
+            font-weight: 800 !important;
+        }
+        </style>
+        """,
         unsafe_allow_html=True,
     )
-    render_site_target_table(df_p2)
 
-    # ── Add future Research Dashboard sections below this line ──────
-    # e.g.:
-    # st.markdown("---")
-    # render_some_other_research_section(df_p2)
+    # ── Tab button row (mimics the layout of monitoring's 3 tabs) ──
+    col1, _ = st.columns([1, 5])
+    with col1:
+        st.button(
+            "📊 Descriptive",
+            key="btn_research_descriptive",
+            type="primary",
+            disabled=True,          # only one tab, always active
+            use_container_width=True,
+        )
+
+    st.markdown(
+        "<hr style='border:none;border-top:1.5px solid #ddd;margin:10px 0 18px;'>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Render the site table ──
+    if df_all.empty:
+        st.info("No data available for the current filters.")
+    else:
+        _render_site_table(df_all)
+
+    # ── Footer with email (matching monitoring dashboard style) ──
+    st.markdown("---")
+    st.markdown(
+        '<div style="text-align:center;padding:2px 0;margin-top:10px;font-size:12px;color:#737373;">'
+        '<b style="color:#0771eb;">Aarogya Aarohan</b>&nbsp;·&nbsp;'
+        'TANUH Oral Cancer Screening Project<br>'
+        'Email: <a href="mailto:oralcancerscreening@tanuh.ai" '
+        'style="color:#0771eb;text-decoration:none;">oralcancerscreening@tanuh.ai</a>'
+        '&nbsp;·&nbsp;© 2026'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Stop execution to prevent app.py from adding its own footer ──
+    st.stop()
