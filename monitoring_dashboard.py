@@ -2260,7 +2260,7 @@ def render(
     if st.session_state.tab == 2:
         # Custom footer for tab 2: hr and text with negative margin to pull up
         st.markdown(
-            "<hr style='border:none;border-top:1px solid #ddd;margin:-60px 0 5px;'>"
+            "<hr style='border:none;border-top:1px solid #ddd;margin:-30px 0 5px;'>"
             '<div style="text-align:center;padding:2px 0;margin-top:20px;font-size:12px;color:#737373;">'
             '<b style="color:#0771eb;">Aarogya Aarohan</b>&nbsp;·&nbsp;'
             'TANUH Oral Cancer Screening Project<br>'
