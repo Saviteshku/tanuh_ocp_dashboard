@@ -206,11 +206,13 @@ def _leaderboard_flw_counts(df: pd.DataFrame) -> pd.DataFrame:
         high_mask = pd.Series(False, index=d.index)
         low_mask  = pd.Series(False, index=d.index)
     non_susp_mask = reviewed_mask & ~suspicious_mask
+    pending_mask  = ~reviewed_mask
 
     total    = d.groupby(flw)[id_col].nunique()
     high     = high_mask.groupby(flw).sum()
     low      = low_mask.groupby(flw).sum()
     non_susp = non_susp_mask.groupby(flw).sum()
+    pending  = pending_mask.groupby(flw).sum()
 
     if "site_full_id" in d.columns:
         site = d.groupby(flw)["site_full_id"].agg(
@@ -223,9 +225,10 @@ def _leaderboard_flw_counts(df: pd.DataFrame) -> pd.DataFrame:
     out["high"]     = high
     out["low"]      = low
     out["non_susp"] = non_susp
+    out["pending"]  = pending
     out["site_full_id"] = site.reindex(out.index).fillna("")
     out = out.fillna(0)
-    for c in ("total", "high", "low", "non_susp"):
+    for c in ("total", "high", "low", "non_susp", "pending"):
         out[c] = out[c].astype(int)
     return out.reset_index()
 
@@ -277,6 +280,11 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
         hovertemplate="Total screened: <b>%{customdata:,}</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
+        y=plot_df["flw_username"], x=plot_df["pending"], orientation="h",
+        name="Pending review", marker_color="#C9C9C9",
+        hovertemplate="Pending review: <b>%{x:,}</b><extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
         y=plot_df["flw_username"], x=plot_df["non_susp"], orientation="h",
         name="Non-suspicious", marker_color="#6B6B6B",
         hovertemplate="Non-suspicious: <b>%{x:,}</b><extra></extra>",
@@ -292,23 +300,32 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
         hovertemplate="Suspicious · High risk: <b>%{x:,}</b><extra></extra>",
     ))
 
-    max_total  = float(plot_df["total"].max())
-    range_max  = max_total + 20
+    max_total = float(plot_df["total"].max())
+    # Axis extends to max total screened + 2, so there's a little room
+    # past the highest bar (ticks fall every 2 counts).
+    range_max = max_total + 2
     x_title = f"Cases screened{f' — {month_label}' if month_label else ''}"
+    chart_h = max(420, 46 * len(plot_df) + 100)
+
     fig.update_layout(
         barmode="stack",
-        height=max(420, 46 * len(plot_df) + 100),
-        margin=dict(t=10, b=40, l=10, r=20),
+        height=chart_h,
+        margin=dict(t=0, b=70, l=10, r=20),
         plot_bgcolor="white",
         paper_bgcolor="white",
         hovermode="y unified",
-        legend=dict(orientation="h", y=1.1, x=0, font=dict(size=12, color="black")),
+        # Legend placed *below* the x-axis title — this never conflicts
+        # with the modebar (top-right), unlike a top-anchored legend.
+        legend=dict(
+            orientation="h", y=-0.22, x=0, yanchor="top", xanchor="left",
+            font=dict(size=12, color="black"),
+        ),
         xaxis=dict(
             title=dict(text=x_title, font=dict(color="black")),
             tickfont=dict(color="black"),
             range=[0, range_max],
             tick0=0,
-            dtick=_nice_dtick(range_max),
+            dtick=2,
             showgrid=True, gridcolor="#f0f0f0", zeroline=False,
         ),
         yaxis=dict(
@@ -373,11 +390,15 @@ def _fig_leaderboard_ai_override(df_p2: pd.DataFrame) -> go.Figure:
             "(<b>%{x:.1f}%</b>)<extra></extra>"
         ),
     ))
-    max_pct   = float(plot_df["pct"].max())
-    range_max = max_pct + 2
+    max_pct = float(plot_df["pct"].max())
+    # Fixed 5%-step ticks; the top tick must sit strictly above the
+    # highest bar so it's always visible on the axis (never falls right
+    # at/under the max value).
+    last_tick = 5 * (int(max_pct // 5) + 1)
+    range_max = last_tick + 3
     fig.update_layout(
         height=max(420, 46 * len(plot_df) + 100),
-        margin=dict(t=10, b=40, l=10, r=120),
+        margin=dict(t=0, b=40, l=10, r=25),
         plot_bgcolor="white",
         paper_bgcolor="white",
         showlegend=False,
@@ -387,7 +408,7 @@ def _fig_leaderboard_ai_override(df_p2: pd.DataFrame) -> go.Figure:
             ticksuffix="%",
             range=[0, range_max],
             tick0=0,
-            dtick=_nice_dtick(range_max),
+            dtick=5,
             showgrid=True, gridcolor="#f0f0f0", zeroline=False,
         ),
         yaxis=dict(
@@ -407,19 +428,24 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
         cur_df, month_lbl = _current_month_df(df_all)
         title_suffix = f" — {month_lbl}" if month_lbl else ""
         st.markdown(
-            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;'>"
+            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
+            "min-height:40px;'>"
             f"🏆 Top 10 FLWs by cases screened{title_suffix}</div>",
             unsafe_allow_html=True,
         )
         fig_counts = _fig_leaderboard_flw_counts(cur_df, month_label=month_lbl)
         if fig_counts.data:
-            st.plotly_chart(fig_counts, width="stretch", key="lb_flw_counts")
+            st.plotly_chart(
+                fig_counts, width="stretch", key="lb_flw_counts",
+                config={"displaylogo": False},
+            )
         else:
             st.info("No FLW-level data available for the current month.")
 
     with col_r:
         st.markdown(
-            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;'>"
+            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
+            "min-height:40px;'>"
             "🤖 Top 10 FLWs by % AI override "
             "<span style='font-size:11px;font-weight:500;color:#888;font-style:italic;'>"
             "(AI-Enabled Screening only)</span></div>",
@@ -427,7 +453,10 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
         )
         fig_override = _fig_leaderboard_ai_override(df_p2)
         if fig_override.data:
-            st.plotly_chart(fig_override, width="stretch", key="lb_ai_override")
+            st.plotly_chart(
+                fig_override, width="stretch", key="lb_ai_override",
+                config={"displaylogo": False},
+            )
         else:
             st.info("No AI-override data available for the current filters.")
 
