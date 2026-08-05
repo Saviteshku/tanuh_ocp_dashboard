@@ -3,8 +3,13 @@
 RESEARCH DASHBOARD — standalone module
 Aarogya Aarohan / TANUH Oral Cancer Project
 
-Single tab ("Descriptive") showing site‑wise summary table with
-the "Screened in <month>" column.
+Two tabs:
+  - "Descriptive": site‑wise summary table with the "Screened in
+    <month>" column.
+  - "Leaderboard": top‑10 FLW (field health worker) leaderboards —
+    cases screened (stacked by Non‑suspicious / Suspicious·Low risk /
+    Suspicious·High risk) and % of AI-Enabled Screening cases where
+    the AI result was overridden.
 
 Uses the same tab‑button style as the Monitoring Dashboard.
 ====================================================================
@@ -17,8 +22,13 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
+
+AMBER_HIGH = "#E0631A"
+AMBER_LOW  = "#F7C548"
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -106,6 +116,32 @@ def _id_col(df: pd.DataFrame) -> str:
 def _is_high_risk(series: pd.Series) -> pd.Series:
     return _norm(series).eq("high risk")
 
+def _is_low_risk(series: pd.Series) -> pd.Series:
+    return _norm(series).eq("low risk")
+
+def _ai_result_col(df: pd.DataFrame) -> str | None:
+    for c in ("ai_result", "AI_Result", "AI Result"):
+        if c in df.columns:
+            return c
+    return None
+
+def _ai_override_col(df: pd.DataFrame) -> str | None:
+    for c in ("ai_override", "AI_Override", "AI Override"):
+        if c in df.columns:
+            return c
+    return None
+
+# Values in the ai_override column that mean "no override happened" —
+# anything else present (e.g. "Yes", an overridden diagnosis label) counts
+# as an override. Blank-like values (see _BLANK_LIKE) are never an override.
+_NOT_OVERRIDE_LIKE = {"no", "false", "0", "not overridden", "no override", "non override"}
+
+def _override_mask(df: pd.DataFrame) -> pd.Series:
+    col = _ai_override_col(df)
+    if col is None:
+        return pd.Series(False, index=df.index)
+    return _present_mask(df[col]) & ~_norm(df[col]).isin(_NOT_OVERRIDE_LIKE)
+
 def _reviewed_mask_phase1(df: pd.DataFrame) -> pd.Series:
     cols = df.columns
     prov = df["provisional_diagnosis"] if "provisional_diagnosis" in cols else pd.Series(False, index=df.index)
@@ -120,6 +156,309 @@ def _choose_status_masks_phase1(df: pd.DataFrame):
     else:
         suspicious_mask = pd.Series(False, index=df.index)
     return reviewed_mask, suspicious_mask
+
+
+def _valid_flw(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Return (rows with a non-blank flw_username, that column as a
+    cleaned string Series aligned to those rows)."""
+    if df.empty or "flw_username" not in df.columns:
+        return df.iloc[0:0], pd.Series(dtype=object)
+    flw = df["flw_username"].astype(str).str.strip()
+    valid = flw.ne("") & ~flw.str.lower().isin(_BLANK_LIKE)
+    return df.loc[valid], flw.loc[valid]
+
+
+def _current_month_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """Return (rows from the most recent calendar month present in
+    date_of_case_registered, that month's label e.g. 'Jul 2026'). Empty
+    df / missing dates yield an empty frame and an empty label."""
+    if df.empty or "date_of_case_registered" not in df.columns:
+        return df.iloc[0:0], ""
+    dates = df["date_of_case_registered"].dropna()
+    if dates.empty:
+        return df.iloc[0:0], ""
+    max_dt = dates.max()
+    mask = (
+        (df["date_of_case_registered"].dt.year == max_dt.year) &
+        (df["date_of_case_registered"].dt.month == max_dt.month)
+    )
+    return df.loc[mask], max_dt.strftime("%b %Y")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Leaderboard — per-FLW stats & charts
+# ════════════════════════════════════════════════════════════════════
+
+def _leaderboard_flw_counts(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-FLW totals: screened count, split into Non-suspicious /
+    Suspicious·Low risk / Suspicious·High risk (high/low only come out of
+    the suspicious subset — the non-suspicious bucket is never split)."""
+    d, flw = _valid_flw(df)
+    if d.empty:
+        return pd.DataFrame()
+
+    id_col = _id_col(d)
+    reviewed_mask, suspicious_mask = _choose_status_masks_phase1(d)
+    if "risk" in d.columns:
+        high_mask = suspicious_mask & _is_high_risk(d["risk"])
+        low_mask  = suspicious_mask & _is_low_risk(d["risk"])
+    else:
+        high_mask = pd.Series(False, index=d.index)
+        low_mask  = pd.Series(False, index=d.index)
+    non_susp_mask = reviewed_mask & ~suspicious_mask
+    pending_mask  = ~reviewed_mask
+
+    total    = d.groupby(flw)[id_col].nunique()
+    high     = high_mask.groupby(flw).sum()
+    low      = low_mask.groupby(flw).sum()
+    non_susp = non_susp_mask.groupby(flw).sum()
+    pending  = pending_mask.groupby(flw).sum()
+
+    if "site_full_id" in d.columns:
+        site = d.groupby(flw)["site_full_id"].agg(
+            lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
+        )
+    else:
+        site = pd.Series("", index=total.index, dtype=object)
+
+    out = pd.DataFrame({"flw_username": total.index, "total": total.values}).set_index("flw_username")
+    out["high"]     = high
+    out["low"]      = low
+    out["non_susp"] = non_susp
+    out["pending"]  = pending
+    out["site_full_id"] = site.reindex(out.index).fillna("")
+    out = out.fillna(0)
+    for c in ("total", "high", "low", "non_susp", "pending"):
+        out[c] = out[c].astype(int)
+    return out.reset_index()
+
+
+def _nice_dtick(range_max: float, target_ticks: int = 5) -> float:
+    """A round tick-step (1/2/2.5/5/10 x a power of ten) that yields
+    roughly `target_ticks` ticks across [0, range_max]. Used so the
+    axis always has a labeled tick sitting past the highest bar rather
+    than the range simply ending in blank padding."""
+    if range_max <= 0:
+        return 1
+    raw_step = range_max / target_ticks
+    magnitude = 10 ** np.floor(np.log10(raw_step))
+    for mult in (1, 2, 2.5, 5, 10):
+        step = mult * magnitude
+        if step >= raw_step:
+            return step
+    return magnitude * 10
+
+
+def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.Figure:
+    """Top-10 FLWs by total screened, horizontal stacked bar (highest at
+    top, lowest at bottom). Hover shows the FLW's site_full_id plus
+    Non-suspicious / Suspicious·Low risk / Suspicious·High risk counts
+    together."""
+    stats = _leaderboard_flw_counts(df)
+    if stats.empty:
+        return go.Figure()
+
+    top = stats.sort_values("total", ascending=False).head(10)
+    # Ascending order so the highest bar ends up plotted at the top of a
+    # horizontal bar chart (Plotly stacks categories bottom-to-top).
+    plot_df = top.sort_values("total", ascending=True)
+
+    fig = go.Figure()
+    # Invisible zero-width bars purely to surface the FLW's site and total
+    # screened count in the unified hover tooltip alongside the visible
+    # segments below.
+    fig.add_trace(go.Bar(
+        y=plot_df["flw_username"], x=[0] * len(plot_df), orientation="h",
+        name="Site", marker=dict(color="rgba(0,0,0,0)"), showlegend=False,
+        customdata=plot_df["site_full_id"],
+        hovertemplate="Site: %{customdata}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=plot_df["flw_username"], x=[0] * len(plot_df), orientation="h",
+        name="Total screened", marker=dict(color="rgba(0,0,0,0)"), showlegend=False,
+        customdata=plot_df["total"],
+        hovertemplate="Total screened: <b>%{customdata:,}</b><extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=plot_df["flw_username"], x=plot_df["pending"], orientation="h",
+        name="Pending review", marker_color="#C9C9C9",
+        hovertemplate="Pending review: <b>%{x:,}</b><extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=plot_df["flw_username"], x=plot_df["non_susp"], orientation="h",
+        name="Non-suspicious", marker_color="#6B6B6B",
+        hovertemplate="Non-suspicious: <b>%{x:,}</b><extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=plot_df["flw_username"], x=plot_df["low"], orientation="h",
+        name="Suspicious · Low risk", marker_color=AMBER_LOW,
+        hovertemplate="Suspicious · Low risk: <b>%{x:,}</b><extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=plot_df["flw_username"], x=plot_df["high"], orientation="h",
+        name="Suspicious · High risk", marker_color=AMBER_HIGH,
+        hovertemplate="Suspicious · High risk: <b>%{x:,}</b><extra></extra>",
+    ))
+
+    max_total = float(plot_df["total"].max())
+    # Axis extends to max total screened + 2, so there's a little room
+    # past the highest bar (ticks fall every 2 counts).
+    range_max = max_total + 2
+    x_title = f"Cases screened{f' — {month_label}' if month_label else ''}"
+    chart_h = max(420, 46 * len(plot_df) + 100)
+
+    fig.update_layout(
+        barmode="stack",
+        height=chart_h,
+        margin=dict(t=0, b=70, l=10, r=20),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        hovermode="y unified",
+        # Legend placed *below* the x-axis title — this never conflicts
+        # with the modebar (top-right), unlike a top-anchored legend.
+        legend=dict(
+            orientation="h", y=-0.22, x=0, yanchor="top", xanchor="left",
+            font=dict(size=12, color="black"),
+        ),
+        xaxis=dict(
+            title=dict(text=x_title, font=dict(color="black")),
+            tickfont=dict(color="black"),
+            range=[0, range_max],
+            tick0=0,
+            dtick=2,
+            showgrid=True, gridcolor="#f0f0f0", zeroline=False,
+        ),
+        yaxis=dict(
+            automargin=True,
+            tickfont=dict(size=12, color="black"),
+        ),
+    )
+    return fig
+
+
+def _leaderboard_ai_override_stats(df_p2: pd.DataFrame) -> pd.DataFrame:
+    """Per-FLW % of AI-Enabled Screening cases where the AI result was
+    overridden, plus the site each FLW is associated with (for hover)."""
+    d, flw = _valid_flw(df_p2)
+    if d.empty:
+        return pd.DataFrame()
+
+    id_col = _id_col(d)
+    override_mask = _override_mask(d)
+
+    total      = d.groupby(flw)[id_col].nunique()
+    overridden = override_mask.groupby(flw).sum()
+
+    if "site_full_id" in d.columns:
+        site = d.groupby(flw)["site_full_id"].agg(
+            lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
+        )
+    else:
+        site = pd.Series("", index=total.index, dtype=object)
+
+    out = pd.DataFrame({"flw_username": total.index, "total": total.values}).set_index("flw_username")
+    out["overridden"]   = overridden.fillna(0).astype(int)
+    out["site_full_id"] = site.reindex(out.index).fillna("")
+    out = out[out["total"] > 0]
+    out["pct"] = (out["overridden"] / out["total"] * 100).round(1)
+    return out.reset_index()
+
+
+def _fig_leaderboard_ai_override(df_p2: pd.DataFrame) -> go.Figure:
+    """Top-10 FLWs by % of AI-Enabled Screening cases overridden (x-axis
+    is a percentage, not a count — AI override only exists in phase 2).
+    Hover shows the FLW's site_full_id."""
+    stats = _leaderboard_ai_override_stats(df_p2)
+    stats = stats[stats["pct"] > 0]
+    if stats.empty:
+        return go.Figure()
+
+    top = stats.sort_values("pct", ascending=False).head(10)
+    plot_df = top.sort_values("pct", ascending=True)
+
+    fig = go.Figure(go.Bar(
+        y=plot_df["flw_username"], x=plot_df["pct"], orientation="h",
+        marker_color="#7A2DE4",
+        customdata=np.stack(
+            [plot_df["overridden"], plot_df["total"], plot_df["site_full_id"]], axis=-1
+        ),
+        text=plot_df["pct"].apply(lambda v: f"{v:.1f}%"),
+        textposition="outside",
+        hovertemplate=(
+            "<b>%{y}</b><br>Site: %{customdata[2]}<br>"
+            "AI Override: <b>%{customdata[0]:,}</b> / %{customdata[1]:,} "
+            "(<b>%{x:.1f}%</b>)<extra></extra>"
+        ),
+    ))
+    max_pct = float(plot_df["pct"].max())
+    # Fixed 5%-step ticks; the top tick must sit strictly above the
+    # highest bar so it's always visible on the axis (never falls right
+    # at/under the max value).
+    last_tick = 5 * (int(max_pct // 5) + 1)
+    range_max = last_tick + 3
+    fig.update_layout(
+        height=max(420, 46 * len(plot_df) + 100),
+        margin=dict(t=0, b=40, l=10, r=25),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+        xaxis=dict(
+            title=dict(text="% AI override (of total screened)", font=dict(color="black")),
+            tickfont=dict(color="black"),
+            ticksuffix="%",
+            range=[0, range_max],
+            tick0=0,
+            dtick=5,
+            showgrid=True, gridcolor="#f0f0f0", zeroline=False,
+        ),
+        yaxis=dict(
+            automargin=True,
+            tickfont=dict(size=12, color="black"),
+        ),
+    )
+    return fig
+
+
+def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
+    """Leaderboard tab: current-month FLW screening-volume leaderboard
+    next to the overall FLW AI-override leaderboard."""
+    col_l, col_r = st.columns(2, gap="large")
+
+    with col_l:
+        cur_df, month_lbl = _current_month_df(df_all)
+        title_suffix = f" — {month_lbl}" if month_lbl else ""
+        st.markdown(
+            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
+            "min-height:40px;'>"
+            f"🏆 Top 10 FLWs by cases screened{title_suffix}</div>",
+            unsafe_allow_html=True,
+        )
+        fig_counts = _fig_leaderboard_flw_counts(cur_df, month_label=month_lbl)
+        if fig_counts.data:
+            st.plotly_chart(
+                fig_counts, width="stretch", key="lb_flw_counts",
+                config={"displaylogo": False},
+            )
+        else:
+            st.info("No FLW-level data available for the current month.")
+
+    with col_r:
+        st.markdown(
+            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
+            "min-height:40px;'>"
+            "🤖 Top 10 FLWs by % AI override "
+            "<span style='font-size:11px;font-weight:500;color:#888;font-style:italic;'>"
+            "(AI-Enabled Screening only)</span></div>",
+            unsafe_allow_html=True,
+        )
+        fig_override = _fig_leaderboard_ai_override(df_p2)
+        if fig_override.data:
+            st.plotly_chart(
+                fig_override, width="stretch", key="lb_ai_override",
+                config={"displaylogo": False},
+            )
+        else:
+            st.info("No AI-override data available for the current filters.")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -314,31 +653,38 @@ def _render_site_table(df: pd.DataFrame) -> None:
 
 def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> None:
     """
-    Render the Research Dashboard – single "Descriptive" tab with site table.
+    Render the Research Dashboard – "Descriptive" and "Leaderboard" tabs.
 
     Parameters
     ----------
     df_all : combined dataset (all phases), already filtered by sidebar.
+             Feeds the Descriptive site table and the Leaderboard's
+             cases-screened chart (Non-suspicious/Suspicious status comes
+             from phase-1 fields, present across the combined dataset).
     df_p1  : phase-1 data (not used, kept for signature compatibility).
-    df_p2  : phase-2 data (not used, kept for signature compatibility).
+    df_p2  : phase-2 (AI-Enabled Screening) data — feeds the Leaderboard's
+             % AI-override chart, since AI results/overrides only exist
+             in phase 2.
     """
     # Password gate
     if not _check_password():
         return
 
-    # ── Style the single tab button to match Monitoring Dashboard ──
+    # ── Style the tab buttons to match Monitoring Dashboard ──
     st.markdown(
         """
         <style>
-        /* Make the research tab button look exactly like the monitoring tabs */
-        .st-key-btn_research_descriptive button {
+        /* Make the research tab buttons look exactly like the monitoring tabs */
+        .st-key-btn_research_descriptive button,
+        .st-key-btn_research_leaderboard button {
             padding: 10px 12px !important;
             font-size: 22px !important;
             font-weight: 800 !important;
             min-height: 0 !important;
             line-height: 1.3 !important;
         }
-        .st-key-btn_research_descriptive button * {
+        .st-key-btn_research_descriptive button *,
+        .st-key-btn_research_leaderboard button * {
             font-weight: 800 !important;
         }
         </style>
@@ -346,27 +692,46 @@ def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> No
         unsafe_allow_html=True,
     )
 
-    # ── Tab button row (mimics the layout of monitoring's 3 tabs) ──
-    col1, _ = st.columns([1, 5])
+    if "research_tab" not in st.session_state:
+        st.session_state.research_tab = 0
+
+    # ── Tab button row — Descriptive · Leaderboard ──
+    col1, col2, _sp = st.columns([1, 1, 4])
     with col1:
-        st.button(
+        if st.button(
             "📊 Descriptive",
             key="btn_research_descriptive",
-            type="primary",
-            disabled=True,          # only one tab, always active
+            type="primary" if st.session_state.research_tab == 0 else "secondary",
             use_container_width=True,
-        )
+        ):
+            st.session_state.research_tab = 0
+            st.rerun()
+    with col2:
+        if st.button(
+            "🏆 Leaderboard",
+            key="btn_research_leaderboard",
+            type="primary" if st.session_state.research_tab == 1 else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state.research_tab = 1
+            st.rerun()
 
     st.markdown(
         "<hr style='border:none;border-top:1.5px solid #ddd;margin:10px 0 18px;'>",
         unsafe_allow_html=True,
     )
 
-    # ── Render the site table ──
-    if df_all.empty:
-        st.info("No data available for the current filters.")
+    # ── Render the active tab ──
+    if st.session_state.research_tab == 0:
+        if df_all.empty:
+            st.info("No data available for the current filters.")
+        else:
+            _render_site_table(df_all)
     else:
-        _render_site_table(df_all)
+        if df_all.empty and df_p2.empty:
+            st.info("No data available for the current filters.")
+        else:
+            _render_leaderboard(df_all, df_p2)
 
     # ── Footer with email (matching monitoring dashboard style) ──
     st.markdown("---")
