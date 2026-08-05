@@ -16,9 +16,12 @@ Uses the same tab‑button style as the Monitoring Dashboard.
 """
 
 from __future__ import annotations
+import hashlib
+import hmac
 import html
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -32,7 +35,8 @@ AMBER_LOW  = "#F7C548"
 
 
 # ════════════════════════════════════════════════════════════════════
-# Password gate (research_dash_password, read from map_data.json)
+# Password gate — salted+hashed password, read from Streamlit secrets
+# or environment variables (never plaintext, never from a data file)
 # ════════════════════════════════════════════════════════════════════
 LOCAL_DATA_DIR = Path(
     os.environ.get(
@@ -43,6 +47,11 @@ LOCAL_DATA_DIR = Path(
 MAP_DATA_PATH = LOCAL_DATA_DIR / "map_data.json"
 
 SESSION_TIMEOUT_SECONDS = 5 * 60
+
+# PBKDF2 iteration count used both when hashing at setup time and when
+# verifying a login attempt — must match whatever was used to generate
+# the stored hash (see _hash_password_for_setup below).
+_PBKDF2_ITERATIONS = 200_000
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -56,9 +65,42 @@ def _load_map_data(path_str: str) -> dict:
         return {}
 
 
-def _research_dashboard_password() -> str | None:
-    pw = _load_map_data(str(MAP_DATA_PATH)).get("research_dash_password")
-    return str(pw) if pw else None
+def _hash_password_for_setup(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+    """One-time helper to generate the (salt_hex, hash_hex) pair to put in
+    st.secrets / env vars. Not called by the app itself — run it once,
+    e.g. `python -c "from research_dashboard import _hash_password_for_setup as h; print(h('mypassword'))"`,
+    then store the two returned hex strings as RESEARCH_DASH_PASSWORD_SALT
+    and RESEARCH_DASH_PASSWORD_HASH (or the st.secrets equivalents)."""
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    return salt.hex(), digest.hex()
+
+
+def _stored_password_credentials() -> tuple[str, str] | None:
+    """Reads (salt_hex, hash_hex) — never a plaintext password — from
+    Streamlit secrets first, then environment variables."""
+    salt_hex = hash_hex = None
+    try:
+        salt_hex = st.secrets.get("research_dash_password_salt")
+        hash_hex = st.secrets.get("research_dash_password_hash")
+    except Exception:
+        pass
+    salt_hex = salt_hex or os.environ.get("RESEARCH_DASH_PASSWORD_SALT")
+    hash_hex = hash_hex or os.environ.get("RESEARCH_DASH_PASSWORD_HASH")
+    if salt_hex and hash_hex:
+        return str(salt_hex), str(hash_hex)
+    return None
+
+
+def _verify_password(entered: str, salt_hex: str, hash_hex: str) -> bool:
+    """Constant-time comparison against the stored PBKDF2 hash."""
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+    except ValueError:
+        return False
+    candidate = hashlib.pbkdf2_hmac("sha256", entered.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    return hmac.compare_digest(candidate, expected)
 
 
 def _check_password() -> bool:
@@ -70,20 +112,23 @@ def _check_password() -> bool:
         del st.session_state["research_dash_authed_at"]
         st.info("Session timed out after 5 minutes of inactivity — please re-enter the password.")
 
-    correct_pw = _research_dashboard_password()
-    if not correct_pw:
+    creds = _stored_password_credentials()
+    if creds is None:
         st.error(
-            "Research Dashboard password isn't configured — add "
-            '"research_dash_password" to map_data.json.'
+            "Research Dashboard password isn't configured — set "
+            "research_dash_password_salt / research_dash_password_hash "
+            "in st.secrets, or RESEARCH_DASH_PASSWORD_SALT / "
+            "RESEARCH_DASH_PASSWORD_HASH as environment variables."
         )
         return False
+    salt_hex, hash_hex = creds
 
     with st.form("research_dash_password_form"):
         entered = st.text_input("🔒 Password", type="password")
         submitted = st.form_submit_button("Unlock")
 
     if submitted:
-        if entered == correct_pw:
+        if _verify_password(entered, salt_hex, hash_hex):
             st.session_state.research_dash_authed_at = time.time()
             st.rerun()
         else:
@@ -190,9 +235,13 @@ def _current_month_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
 # ════════════════════════════════════════════════════════════════════
 
 def _leaderboard_flw_counts(df: pd.DataFrame) -> pd.DataFrame:
-    """Per-FLW totals: screened count, split into Non-suspicious /
+    """Per-(FLW, state) totals: screened count, split into Non-suspicious /
     Suspicious·Low risk / Suspicious·High risk (high/low only come out of
-    the suspicious subset — the non-suspicious bucket is never split)."""
+    the suspicious subset — the non-suspicious bucket is never split).
+
+    Grouped by (flw_username, states) rather than flw_username alone, since
+    the same flw_username can appear under multiple states — each such
+    pairing gets its own row (and its own bar)."""
     d, flw = _valid_flw(df)
     if d.empty:
         return pd.DataFrame()
@@ -208,29 +257,47 @@ def _leaderboard_flw_counts(df: pd.DataFrame) -> pd.DataFrame:
     non_susp_mask = reviewed_mask & ~suspicious_mask
     pending_mask  = ~reviewed_mask
 
-    total    = d.groupby(flw)[id_col].nunique()
-    high     = high_mask.groupby(flw).sum()
-    low      = low_mask.groupby(flw).sum()
-    non_susp = non_susp_mask.groupby(flw).sum()
-    pending  = pending_mask.groupby(flw).sum()
-
-    if "site_full_id" in d.columns:
-        site = d.groupby(flw)["site_full_id"].agg(
-            lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
-        )
+    state_col = "states" if "states" in d.columns else ("state" if "state" in d.columns else None)
+    if state_col is not None:
+        state = d[state_col].astype(str).str.strip()
+        state = state.where(_present_mask(d[state_col]), "")
     else:
-        site = pd.Series("", index=total.index, dtype=object)
+        state = pd.Series("", index=d.index, dtype=object)
+    state.name = "states"
 
-    out = pd.DataFrame({"flw_username": total.index, "total": total.values}).set_index("flw_username")
+    site_col = "site_full_id" if "site_full_id" in d.columns else None
+    if site_col is not None:
+        site_full_id = d[site_col].astype(str).str.strip()
+        site_full_id = site_full_id.where(_present_mask(d[site_col]), "")
+    else:
+        site_full_id = pd.Series("", index=d.index, dtype=object)
+    site_full_id.name = "site_full_id"
+
+    grp = [flw, state, site_full_id]
+    total    = d.groupby(grp)[id_col].nunique()
+    high     = high_mask.groupby(grp).sum()
+    low      = low_mask.groupby(grp).sum()
+    non_susp = non_susp_mask.groupby(grp).sum()
+    pending  = pending_mask.groupby(grp).sum()
+
+    out = total.rename("total").to_frame()
     out["high"]     = high
     out["low"]      = low
     out["non_susp"] = non_susp
     out["pending"]  = pending
-    out["site_full_id"] = site.reindex(out.index).fillna("")
     out = out.fillna(0)
     for c in ("total", "high", "low", "non_susp", "pending"):
         out[c] = out[c].astype(int)
-    return out.reset_index()
+    out = out.reset_index()
+    out.columns = ["flw_username", "states", "site_full_id", "total", "high", "low", "non_susp", "pending"]
+    # Display label used on the y-axis / legend so the same flw_username
+    # shows up as separate, clearly-labeled bars per state, e.g.
+    # "flw2" on one line, "Karnataka" on the next.
+    out["label"] = out.apply(
+        lambda r: f"{r['flw_username']}<br>{r['states']}" if r["states"] else r["flw_username"],
+        axis=1,
+    )
+    return out
 
 
 def _nice_dtick(range_max: float, target_ticks: int = 5) -> float:
@@ -250,10 +317,12 @@ def _nice_dtick(range_max: float, target_ticks: int = 5) -> float:
 
 
 def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.Figure:
-    """Top-10 FLWs by total screened, horizontal stacked bar (highest at
-    top, lowest at bottom). Hover shows the FLW's site_full_id plus
-    Non-suspicious / Suspicious·Low risk / Suspicious·High risk counts
-    together."""
+    """Top-10 (FLW, state) pairs by total screened, horizontal stacked bar
+    (highest at top, lowest at bottom). The same flw_username can appear
+    under multiple states, so each pairing gets its own bar, labeled
+    "<flw_username>" then state on the next line on the y-axis. Hover shows
+    the site_full_id plus Non-suspicious / Suspicious·Low risk / Suspicious·High
+    risk counts together — all correctly scoped to that FLW+state pair."""
     stats = _leaderboard_flw_counts(df)
     if stats.empty:
         return go.Figure()
@@ -264,38 +333,37 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
     plot_df = top.sort_values("total", ascending=True)
 
     fig = go.Figure()
-    # Invisible zero-width bars purely to surface the FLW's site and total
-    # screened count in the unified hover tooltip alongside the visible
-    # segments below.
+    # Invisible zero-width bar to surface the site_full_id in the unified hover
     fig.add_trace(go.Bar(
-        y=plot_df["flw_username"], x=[0] * len(plot_df), orientation="h",
+        y=plot_df["label"], x=[0] * len(plot_df), orientation="h",
         name="Site", marker=dict(color="rgba(0,0,0,0)"), showlegend=False,
         customdata=plot_df["site_full_id"],
         hovertemplate="Site: %{customdata}<extra></extra>",
     ))
+    # Invisible zero-width bar to surface total screened in the unified hover
     fig.add_trace(go.Bar(
-        y=plot_df["flw_username"], x=[0] * len(plot_df), orientation="h",
+        y=plot_df["label"], x=[0] * len(plot_df), orientation="h",
         name="Total screened", marker=dict(color="rgba(0,0,0,0)"), showlegend=False,
         customdata=plot_df["total"],
         hovertemplate="Total screened: <b>%{customdata:,}</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        y=plot_df["flw_username"], x=plot_df["pending"], orientation="h",
+        y=plot_df["label"], x=plot_df["pending"], orientation="h",
         name="Pending review", marker_color="#C9C9C9",
         hovertemplate="Pending review: <b>%{x:,}</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        y=plot_df["flw_username"], x=plot_df["non_susp"], orientation="h",
+        y=plot_df["label"], x=plot_df["non_susp"], orientation="h",
         name="Non-suspicious", marker_color="#6B6B6B",
         hovertemplate="Non-suspicious: <b>%{x:,}</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        y=plot_df["flw_username"], x=plot_df["low"], orientation="h",
+        y=plot_df["label"], x=plot_df["low"], orientation="h",
         name="Suspicious · Low risk", marker_color=AMBER_LOW,
         hovertemplate="Suspicious · Low risk: <b>%{x:,}</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        y=plot_df["flw_username"], x=plot_df["high"], orientation="h",
+        y=plot_df["label"], x=plot_df["high"], orientation="h",
         name="Suspicious · High risk", marker_color=AMBER_HIGH,
         hovertemplate="Suspicious · High risk: <b>%{x:,}</b><extra></extra>",
     ))
