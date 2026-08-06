@@ -492,8 +492,18 @@ _FULLSCREEN_FONT_JS = """
   function bump(n) { return n ? Math.round(n * SCALE) : n; }
   function unbump(n) { return n ? Math.round(n / SCALE) : n; }
 
+  function isSankey(gd) {
+    return !!(gd && gd.data && gd.data.some(function(t) { return t.type === "sankey"; }));
+  }
+
   function applyBigFonts(gd) {
     if (!gd || !gd.layout || gd.dataset.fsFontBumped === "1") return;
+    // Sankey labels are drawn per-node next to fixed-position nodes, not
+    // on an axis/legend — bumping font.size here (without also growing
+    // margins and node spacing) makes label text overflow the node's
+    // fixed margin and get clipped in fullscreen. The Sankey's own
+    // sizing already adapts to its container, so skip the bump for it.
+    if (isSankey(gd)) return;
     const L = gd.layout;
     const update = {};
     if (L.font && L.font.size)                         update["font.size"] = bump(L.font.size);
@@ -507,6 +517,7 @@ _FULLSCREEN_FONT_JS = """
 
   function revertFonts(gd) {
     if (!gd || !gd.layout || gd.dataset.fsFontBumped !== "1") return;
+    if (isSankey(gd)) return;
     const L = gd.layout;
     const update = {};
     if (L.font && L.font.size)                         update["font.size"] = unbump(L.font.size);

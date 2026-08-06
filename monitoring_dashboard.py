@@ -928,7 +928,16 @@ def _fig_sankey_phase2(df: pd.DataFrame, sw: int = 1200) -> go.Figure:
     link_customdata = np.stack([list(vals), pcts_f], axis=-1)
 
     # -------- Height & margins: slightly shorter, balanced bottom --------
-    fig_height = plot_height_from_width(sw) + 140 
+    # Height is capped off a 1920×1200-laptop-equivalent column width
+    # (~822px) rather than the actual (possibly much wider) `sw`. Past
+    # that point a bigger monitor gives the sankey more *horizontal*
+    # room (via width="stretch" in the caller) but the figure stops
+    # growing *taller* — otherwise a 2560×1440 screen's ~1142px column
+    # pushed the height anchors well past what looked right at
+    # 1920×1200, making the chart look oversized/sparse rather than
+    # just bigger.
+    _height_sw = min(sw, 822)
+    fig_height = plot_height_from_width(_height_sw) + 140
     top_mg     = max(40, int(fig_height * 0.05))
     bot_mg     = max(120, int(fig_height * 0.08)) 
     right_mg   = max(80, int(sw * 0.12))

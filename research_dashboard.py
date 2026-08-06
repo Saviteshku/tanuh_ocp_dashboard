@@ -390,7 +390,7 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
         ),
         xaxis=dict(
             title=dict(text=x_title, font=dict(color="black")),
-            tickfont=dict(color="black"),
+            tickfont=dict(size=14, color="black"),
             range=[0, range_max],
             tick0=0,
             dtick=2,
@@ -398,7 +398,7 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
         ),
         yaxis=dict(
             automargin=True,
-            tickfont=dict(size=12, color="black"),
+            tickfont=dict(size=14, color="black"),
         ),
     )
     return fig
@@ -407,9 +407,10 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
 def _leaderboard_ai_override_stats(df_p2: pd.DataFrame) -> pd.DataFrame:
     """Per-FLW % of AI-Enabled Screening cases where the AI result was
     overridden, plus the site each FLW is associated with (for hover)."""
+    empty = pd.DataFrame(columns=["flw_username", "total", "overridden", "site_full_id", "pct"])
     d, flw = _valid_flw(df_p2)
     if d.empty:
-        return pd.DataFrame()
+        return empty
 
     id_col = _id_col(d)
     override_mask = _override_mask(d)
@@ -452,6 +453,7 @@ def _fig_leaderboard_ai_override(df_p2: pd.DataFrame) -> go.Figure:
         ),
         text=plot_df["pct"].apply(lambda v: f"{v:.1f}%"),
         textposition="outside",
+        textfont=dict(size=14, color="black"),
         hovertemplate=(
             "<b>%{y}</b><br>Site: %{customdata[2]}<br>"
             "AI Override: <b>%{customdata[0]:,}</b> / %{customdata[1]:,} "
@@ -459,11 +461,10 @@ def _fig_leaderboard_ai_override(df_p2: pd.DataFrame) -> go.Figure:
         ),
     ))
     max_pct = float(plot_df["pct"].max())
-    # Fixed 5%-step ticks; the top tick must sit strictly above the
-    # highest bar so it's always visible on the axis (never falls right
-    # at/under the max value).
-    last_tick = 5 * (int(max_pct // 5) + 1)
-    range_max = last_tick + 3
+    # Range extends to max value + 10 percentage points of headroom, so the
+    # outside "xx.x%" label never gets clipped at the right edge. Ticks at
+    # a fixed 10%-interval.
+    range_max = max_pct + 10
     fig.update_layout(
         height=max(420, 46 * len(plot_df) + 100),
         margin=dict(t=0, b=40, l=10, r=25),
@@ -472,19 +473,130 @@ def _fig_leaderboard_ai_override(df_p2: pd.DataFrame) -> go.Figure:
         showlegend=False,
         xaxis=dict(
             title=dict(text="% AI override (of total screened)", font=dict(color="black")),
-            tickfont=dict(color="black"),
+            tickfont=dict(size=14, color="black"),
             ticksuffix="%",
             range=[0, range_max],
             tick0=0,
-            dtick=5,
+            dtick=10,
             showgrid=True, gridcolor="#f0f0f0", zeroline=False,
         ),
         yaxis=dict(
             automargin=True,
-            tickfont=dict(size=12, color="black"),
+            tickfont=dict(size=14, color="black"),
         ),
     )
     return fig
+
+
+def _last_n_months_df(df: pd.DataFrame, n_months: int = 3) -> tuple[pd.DataFrame, str]:
+    """Return (rows from the most recent `n_months` calendar months present
+    in date_of_case_registered, inclusive of the latest month; a label for
+    that window, e.g. 'May - Jul 2026' or just 'Jul 2026' if it's a single
+    month). Mirrors _current_month_df's "latest date in the data" anchoring,
+    just widened to a rolling N-month window instead of a single calendar
+    month."""
+    if df.empty or "date_of_case_registered" not in df.columns:
+        return df.iloc[0:0], ""
+    dates = df["date_of_case_registered"].dropna()
+    if dates.empty:
+        return df.iloc[0:0], ""
+    max_dt = dates.max()
+    start_period = max_dt.to_period("M") - (n_months - 1)
+    cutoff = start_period.to_timestamp()
+    mask = df["date_of_case_registered"] >= cutoff
+    start_lbl = start_period.to_timestamp().strftime("%b %Y")
+    end_lbl = max_dt.strftime("%b %Y")
+    label = end_lbl if start_lbl == end_lbl else f"{start_lbl} - {end_lbl}"
+    return df.loc[mask], label
+
+
+def _leaderboard_retake_photo_stats(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """Per-FLW % of cases (past 3 months, all phases combined) where
+    specialist_recommendation was "Retake photo", plus the site each FLW
+    is associated with (for hover). Also returns the 3-month window label."""
+    empty = pd.DataFrame(columns=["flw_username", "total", "retake", "site_full_id", "pct"])
+    recent, window_lbl = _last_n_months_df(df, n_months=3)
+    d, flw = _valid_flw(recent)
+    if d.empty or "specialist_recommendation" not in d.columns:
+        return empty, window_lbl
+
+    id_col = _id_col(d)
+    retake_mask = _norm(d["specialist_recommendation"]).eq("retake photo")
+
+    total  = d.groupby(flw)[id_col].nunique()
+    retake = retake_mask.groupby(flw).sum()
+
+    if "site_full_id" in d.columns:
+        site = d.groupby(flw)["site_full_id"].agg(
+            lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
+        )
+    else:
+        site = pd.Series("", index=total.index, dtype=object)
+
+    out = pd.DataFrame({"flw_username": total.index, "total": total.values}).set_index("flw_username")
+    out["retake"]       = retake.fillna(0).astype(int)
+    out["site_full_id"] = site.reindex(out.index).fillna("")
+    out = out[out["total"] > 0]
+    out["pct"] = (out["retake"] / out["total"] * 100).round(1)
+    return out.reset_index(), window_lbl
+
+
+def _fig_leaderboard_retake_photo(df: pd.DataFrame) -> tuple[go.Figure, str]:
+    """Top-10 FLWs by % of cases (past 3 months, all phases combined)
+    flagged "Retake photo" by the specialist. Hover shows the FLW's
+    site_full_id plus the raw retake / total counts. Also returns the
+    3-month window label (e.g. 'May - Jul 2026') for the chart title."""
+    stats, window_lbl = _leaderboard_retake_photo_stats(df)
+    stats = stats[stats["pct"] > 0]
+    if stats.empty:
+        return go.Figure(), window_lbl
+
+    top = stats.sort_values("pct", ascending=False).head(10)
+    plot_df = top.sort_values("pct", ascending=True)
+
+    fig = go.Figure(go.Bar(
+        y=plot_df["flw_username"], x=plot_df["pct"], orientation="h",
+        marker_color="#0F9D8C",
+        customdata=np.stack(
+            [plot_df["retake"], plot_df["total"], plot_df["site_full_id"]], axis=-1
+        ),
+        text=plot_df["pct"].apply(lambda v: f"{v:.1f}%"),
+        textposition="outside",
+        textfont=dict(size=14, color="black"),
+        hovertemplate=(
+            "<b>%{y}</b><br>Site: %{customdata[2]}<br>"
+            "Retake photo: <b>%{customdata[0]:,}</b> / %{customdata[1]:,} "
+            "(<b>%{x:.1f}%</b>)<extra></extra>"
+        ),
+    ))
+    max_pct = float(plot_df["pct"].max())
+    # Range extends to max value + 10 percentage points of headroom, so the
+    # outside "xx.x%" label never gets clipped at the right edge. Ticks at
+    # a fixed 10%-interval.
+    range_max = max_pct + 10
+    x_title = "% Retake photo (of total screened"
+    x_title += f", {window_lbl})" if window_lbl else ")"
+    fig.update_layout(
+        height=max(420, 46 * len(plot_df) + 100),
+        margin=dict(t=0, b=40, l=10, r=25),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+        xaxis=dict(
+            title=dict(text=x_title, font=dict(color="black")),
+            tickfont=dict(size=14, color="black"),
+            ticksuffix="%",
+            range=[0, range_max],
+            tick0=0,
+            dtick=10,
+            showgrid=True, gridcolor="#f0f0f0", zeroline=False,
+        ),
+        yaxis=dict(
+            automargin=True,
+            tickfont=dict(size=14, color="black"),
+        ),
+    )
+    return fig, window_lbl
 
 
 def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
@@ -509,6 +621,26 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
             )
         else:
             st.info("No FLW-level data available for the current month.")
+
+        st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
+
+        fig_retake, retake_window_lbl = _fig_leaderboard_retake_photo(df_all)
+        retake_suffix = f" — {retake_window_lbl}" if retake_window_lbl else ""
+        st.markdown(
+            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
+            "min-height:40px;'>"
+            f"📸 Top 10 FLWs by % Retake Photo{retake_suffix} "
+            "<span style='font-size:11px;font-weight:500;color:#888;font-style:italic;'>"
+            "(all phases)</span></div>",
+            unsafe_allow_html=True,
+        )
+        if fig_retake.data:
+            st.plotly_chart(
+                fig_retake, width="stretch", key="lb_retake_photo",
+                config={"displaylogo": False},
+            )
+        else:
+            st.info("No 'Retake photo' recommendations available for the last 3 months.")
 
     with col_r:
         st.markdown(
