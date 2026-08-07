@@ -3,13 +3,16 @@
 RESEARCH DASHBOARD — standalone module
 Aarogya Aarohan / TANUH Oral Cancer Project
 
-Two tabs:
+Three tabs:
   - "Descriptive": site‑wise summary table with the "Screened in
     <month>" column.
   - "Leaderboard": top‑10 FLW (field health worker) leaderboards —
     cases screened (stacked by Non‑suspicious / Suspicious·Low risk /
     Suspicious·High risk) and % of AI-Enabled Screening cases where
     the AI result was overridden.
+  - "AI Inference": phase‑2 confusion matrix (AI Result vs the TSD's
+    Suspicion field as ground truth) alongside its derived diagnostic
+    metrics — sensitivity, specificity, PPV, NPV, prevalence, +LR, -LR.
 
 Uses the same tab‑button style as the Monitoring Dashboard.
 ====================================================================
@@ -20,13 +23,16 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import secrets
+import textwrap
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.colors as pcolors
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -213,6 +219,41 @@ def _valid_flw(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return df.loc[valid], flw.loc[valid]
 
 
+def _flw_state_series(d: pd.DataFrame) -> pd.Series:
+    """Cleaned 'states' Series aligned to `d` — "" where missing/blank.
+    Shared by every leaderboard stat function so an FLW is always grouped
+    by (flw_username, states, site_full_id), since the same flw_username
+    can appear under more than one state/site."""
+    state_col = "states" if "states" in d.columns else ("state" if "state" in d.columns else None)
+    if state_col is None:
+        return pd.Series("", index=d.index, dtype=object, name="states")
+    state = d[state_col].astype(str).str.strip()
+    state = state.where(_present_mask(d[state_col]), "")
+    state.name = "states"
+    return state
+
+
+def _flw_site_series(d: pd.DataFrame) -> pd.Series:
+    """Cleaned 'site_full_id' Series aligned to `d` — "" where missing/blank."""
+    site_col = "site_full_id" if "site_full_id" in d.columns else None
+    if site_col is None:
+        return pd.Series("", index=d.index, dtype=object, name="site_full_id")
+    site = d[site_col].astype(str).str.strip()
+    site = site.where(_present_mask(d[site_col]), "")
+    site.name = "site_full_id"
+    return site
+
+
+def _flw_label_col(out: pd.DataFrame) -> pd.Series:
+    """Y-axis label: "<flw_username>" then the state on the next line,
+    e.g. "flw2" / "Karnataka" — so the same flw_username shows up as
+    separate, clearly-labeled bars per state instead of colliding."""
+    return out.apply(
+        lambda r: f"{r['flw_username']}<br>{r['states']}" if r["states"] else r["flw_username"],
+        axis=1,
+    )
+
+
 def _current_month_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     """Return (rows from the most recent calendar month present in
     date_of_case_registered, that month's label e.g. 'Jul 2026'). Empty
@@ -257,21 +298,8 @@ def _leaderboard_flw_counts(df: pd.DataFrame) -> pd.DataFrame:
     non_susp_mask = reviewed_mask & ~suspicious_mask
     pending_mask  = ~reviewed_mask
 
-    state_col = "states" if "states" in d.columns else ("state" if "state" in d.columns else None)
-    if state_col is not None:
-        state = d[state_col].astype(str).str.strip()
-        state = state.where(_present_mask(d[state_col]), "")
-    else:
-        state = pd.Series("", index=d.index, dtype=object)
-    state.name = "states"
-
-    site_col = "site_full_id" if "site_full_id" in d.columns else None
-    if site_col is not None:
-        site_full_id = d[site_col].astype(str).str.strip()
-        site_full_id = site_full_id.where(_present_mask(d[site_col]), "")
-    else:
-        site_full_id = pd.Series("", index=d.index, dtype=object)
-    site_full_id.name = "site_full_id"
+    state = _flw_state_series(d)
+    site_full_id = _flw_site_series(d)
 
     grp = [flw, state, site_full_id]
     total    = d.groupby(grp)[id_col].nunique()
@@ -293,10 +321,7 @@ def _leaderboard_flw_counts(df: pd.DataFrame) -> pd.DataFrame:
     # Display label used on the y-axis / legend so the same flw_username
     # shows up as separate, clearly-labeled bars per state, e.g.
     # "flw2" on one line, "Karnataka" on the next.
-    out["label"] = out.apply(
-        lambda r: f"{r['flw_username']}<br>{r['states']}" if r["states"] else r["flw_username"],
-        axis=1,
-    )
+    out["label"] = _flw_label_col(out)
     return out
 
 
@@ -405,32 +430,37 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
 
 
 def _leaderboard_ai_override_stats(df_p2: pd.DataFrame) -> pd.DataFrame:
-    """Per-FLW % of AI-Enabled Screening cases where the AI result was
-    overridden, plus the site each FLW is associated with (for hover)."""
-    empty = pd.DataFrame(columns=["flw_username", "total", "overridden", "site_full_id", "pct"])
+    """Per-(FLW, state, site) % of AI-Enabled Screening cases where the AI
+    result was overridden. Grouped by (flw_username, states, site_full_id)
+    rather than flw_username alone, since the same flw_username can appear
+    under multiple states/sites — each such pairing gets its own row."""
+    empty = pd.DataFrame(
+        columns=["flw_username", "states", "site_full_id", "total", "overridden", "pct", "label"]
+    )
     d, flw = _valid_flw(df_p2)
     if d.empty:
         return empty
 
     id_col = _id_col(d)
     override_mask = _override_mask(d)
+    state = _flw_state_series(d)
+    site_full_id = _flw_site_series(d)
 
-    total      = d.groupby(flw)[id_col].nunique()
-    overridden = override_mask.groupby(flw).sum()
+    grp = [flw, state, site_full_id]
+    total      = d.groupby(grp)[id_col].nunique()
+    overridden = override_mask.groupby(grp).sum()
 
-    if "site_full_id" in d.columns:
-        site = d.groupby(flw)["site_full_id"].agg(
-            lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
-        )
-    else:
-        site = pd.Series("", index=total.index, dtype=object)
-
-    out = pd.DataFrame({"flw_username": total.index, "total": total.values}).set_index("flw_username")
-    out["overridden"]   = overridden.fillna(0).astype(int)
-    out["site_full_id"] = site.reindex(out.index).fillna("")
+    out = total.rename("total").to_frame()
+    out["overridden"] = overridden
+    out = out.fillna(0)
+    out["total"] = out["total"].astype(int)
+    out["overridden"] = out["overridden"].astype(int)
+    out = out.reset_index()
+    out.columns = ["flw_username", "states", "site_full_id", "total", "overridden"]
     out = out[out["total"] > 0]
     out["pct"] = (out["overridden"] / out["total"] * 100).round(1)
-    return out.reset_index()
+    out["label"] = _flw_label_col(out)
+    return out
 
 
 def _fig_leaderboard_ai_override(df_p2: pd.DataFrame) -> go.Figure:
@@ -446,16 +476,17 @@ def _fig_leaderboard_ai_override(df_p2: pd.DataFrame) -> go.Figure:
     plot_df = top.sort_values("pct", ascending=True)
 
     fig = go.Figure(go.Bar(
-        y=plot_df["flw_username"], x=plot_df["pct"], orientation="h",
+        y=plot_df["label"], x=plot_df["pct"], orientation="h",
         marker_color="#7A2DE4",
         customdata=np.stack(
-            [plot_df["overridden"], plot_df["total"], plot_df["site_full_id"]], axis=-1
+            [plot_df["overridden"], plot_df["total"], plot_df["site_full_id"], plot_df["flw_username"]],
+            axis=-1,
         ),
         text=plot_df["pct"].apply(lambda v: f"{v:.1f}%"),
         textposition="outside",
         textfont=dict(size=14, color="black"),
         hovertemplate=(
-            "<b>%{y}</b><br>Site: %{customdata[2]}<br>"
+            "<b>%{customdata[3]}</b><br>Site: %{customdata[2]}<br>"
             "AI Override: <b>%{customdata[0]:,}</b> / %{customdata[1]:,} "
             "(<b>%{x:.1f}%</b>)<extra></extra>"
         ),
@@ -494,7 +525,15 @@ def _last_n_months_df(df: pd.DataFrame, n_months: int = 3) -> tuple[pd.DataFrame
     that window, e.g. 'May - Jul 2026' or just 'Jul 2026' if it's a single
     month). Mirrors _current_month_df's "latest date in the data" anchoring,
     just widened to a rolling N-month window instead of a single calendar
-    month."""
+    month.
+
+    The label reflects the earliest date actually present in the
+    resulting rows, not the theoretical N-month lookback boundary. This
+    matters once a caller (e.g. a sidebar "Quick date filter") has
+    already narrowed `df` upstream: if only August data survives that
+    upstream filter, the 6-month lookback here still computes a March
+    cutoff, but since no rows exist before August, the label should read
+    just "Aug 2026" rather than the misleading "Mar 2026 - Aug 2026"."""
     if df.empty or "date_of_case_registered" not in df.columns:
         return df.iloc[0:0], ""
     dates = df["date_of_case_registered"].dropna()
@@ -504,48 +543,56 @@ def _last_n_months_df(df: pd.DataFrame, n_months: int = 3) -> tuple[pd.DataFrame
     start_period = max_dt.to_period("M") - (n_months - 1)
     cutoff = start_period.to_timestamp()
     mask = df["date_of_case_registered"] >= cutoff
-    start_lbl = start_period.to_timestamp().strftime("%b %Y")
+    result = df.loc[mask]
+    actual_min = result["date_of_case_registered"].dropna().min()
+    start_lbl = (actual_min if pd.notna(actual_min) else max_dt).strftime("%b %Y")
     end_lbl = max_dt.strftime("%b %Y")
     label = end_lbl if start_lbl == end_lbl else f"{start_lbl} - {end_lbl}"
-    return df.loc[mask], label
+    return result, label
 
 
 def _leaderboard_retake_photo_stats(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-    """Per-FLW % of cases (past 3 months, all phases combined) where
-    specialist_recommendation was "Retake photo", plus the site each FLW
-    is associated with (for hover). Also returns the 3-month window label."""
-    empty = pd.DataFrame(columns=["flw_username", "total", "retake", "site_full_id", "pct"])
-    recent, window_lbl = _last_n_months_df(df, n_months=3)
+    """Per-(FLW, state, site) % of cases (past 3 months, all phases
+    combined) where specialist_recommendation was "Retake photo". Grouped
+    by (flw_username, states, site_full_id) rather than flw_username alone,
+    since the same flw_username can appear under multiple states/sites —
+    each such pairing gets its own row. Also returns the 6-month window
+    label."""
+    empty = pd.DataFrame(
+        columns=["flw_username", "states", "site_full_id", "total", "retake", "pct", "label"]
+    )
+    recent, window_lbl = _last_n_months_df(df, n_months=6)
     d, flw = _valid_flw(recent)
     if d.empty or "specialist_recommendation" not in d.columns:
         return empty, window_lbl
 
     id_col = _id_col(d)
     retake_mask = _norm(d["specialist_recommendation"]).eq("retake photo")
+    state = _flw_state_series(d)
+    site_full_id = _flw_site_series(d)
 
-    total  = d.groupby(flw)[id_col].nunique()
-    retake = retake_mask.groupby(flw).sum()
+    grp = [flw, state, site_full_id]
+    total  = d.groupby(grp)[id_col].nunique()
+    retake = retake_mask.groupby(grp).sum()
 
-    if "site_full_id" in d.columns:
-        site = d.groupby(flw)["site_full_id"].agg(
-            lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
-        )
-    else:
-        site = pd.Series("", index=total.index, dtype=object)
-
-    out = pd.DataFrame({"flw_username": total.index, "total": total.values}).set_index("flw_username")
-    out["retake"]       = retake.fillna(0).astype(int)
-    out["site_full_id"] = site.reindex(out.index).fillna("")
+    out = total.rename("total").to_frame()
+    out["retake"] = retake
+    out = out.fillna(0)
+    out["total"] = out["total"].astype(int)
+    out["retake"] = out["retake"].astype(int)
+    out = out.reset_index()
+    out.columns = ["flw_username", "states", "site_full_id", "total", "retake"]
     out = out[out["total"] > 0]
     out["pct"] = (out["retake"] / out["total"] * 100).round(1)
-    return out.reset_index(), window_lbl
+    out["label"] = _flw_label_col(out)
+    return out, window_lbl
 
 
 def _fig_leaderboard_retake_photo(df: pd.DataFrame) -> tuple[go.Figure, str]:
-    """Top-10 FLWs by % of cases (past 3 months, all phases combined)
+    """Top-10 FLWs by % of cases (past 6 months, all phases combined)
     flagged "Retake photo" by the specialist. Hover shows the FLW's
     site_full_id plus the raw retake / total counts. Also returns the
-    3-month window label (e.g. 'May - Jul 2026') for the chart title."""
+    6-month window label (e.g. 'Mar - Aug 2026') for the chart title."""
     stats, window_lbl = _leaderboard_retake_photo_stats(df)
     stats = stats[stats["pct"] > 0]
     if stats.empty:
@@ -555,16 +602,17 @@ def _fig_leaderboard_retake_photo(df: pd.DataFrame) -> tuple[go.Figure, str]:
     plot_df = top.sort_values("pct", ascending=True)
 
     fig = go.Figure(go.Bar(
-        y=plot_df["flw_username"], x=plot_df["pct"], orientation="h",
+        y=plot_df["label"], x=plot_df["pct"], orientation="h",
         marker_color="#0F9D8C",
         customdata=np.stack(
-            [plot_df["retake"], plot_df["total"], plot_df["site_full_id"]], axis=-1
+            [plot_df["retake"], plot_df["total"], plot_df["site_full_id"], plot_df["flw_username"]],
+            axis=-1,
         ),
         text=plot_df["pct"].apply(lambda v: f"{v:.1f}%"),
         textposition="outside",
         textfont=dict(size=14, color="black"),
         hovertemplate=(
-            "<b>%{y}</b><br>Site: %{customdata[2]}<br>"
+            "<b>%{customdata[3]}</b><br>Site: %{customdata[2]}<br>"
             "Retake photo: <b>%{customdata[0]:,}</b> / %{customdata[1]:,} "
             "(<b>%{x:.1f}%</b>)<extra></extra>"
         ),
@@ -597,6 +645,317 @@ def _fig_leaderboard_retake_photo(df: pd.DataFrame) -> tuple[go.Figure, str]:
         ),
     )
     return fig, window_lbl
+
+
+def _site_flw_activity_stats(df: pd.DataFrame) -> tuple[pd.DataFrame, str, float]:
+    """Per-(site_full_id, flw_username) case count over the last 6
+    calendar months (all phases combined) — how many cases each FLW
+    recruited/screened at each site. Also returns the window label and
+    the number of weeks actually spanned by that window (based on the
+    earliest and latest case-registration dates present, not a fixed
+    26-week assumption), used to turn the raw cases/FLW ratio into a
+    cases/FLW/week rate.
+
+    Note: this only covers FLWs with at least one case in the window.
+    An FLW who recruited zero cases in the period leaves no rows in the
+    case-level data at all, so they can't be told apart from an FLW who
+    was never assigned to that site — there's no FLW roster in this data
+    to compare against. The lowest-count active FLWs (sorted first in
+    the hover list) are the closest available signal for underperformance."""
+    empty = pd.DataFrame(columns=["site_full_id", "flw_username", "total"])
+    recent, window_lbl = _last_n_months_df(df, n_months=6)
+    if recent.empty:
+        return empty, window_lbl, 1.0
+    dates = recent["date_of_case_registered"].dropna()
+    weeks = max((dates.max() - dates.min()).days / 7, 1.0) if not dates.empty else 1.0
+    d, flw = _valid_flw(recent)
+    if d.empty:
+        return empty, window_lbl, weeks
+
+    id_col = _id_col(d)
+    site = _flw_site_series(d)
+    site = site.where(site.ne(""), "Unknown site")
+
+    total = d.groupby([site, flw])[id_col].nunique()
+    out = total.rename("total").reset_index()
+    out.columns = ["site_full_id", "flw_username", "total"]
+    return out, window_lbl, weeks
+
+
+_SITE_TILE_PALETTE = [
+    "#4C6EF5", "#12B886", "#FA5252", "#F59F00", "#7950F2",
+    "#E64980", "#15AABF", "#82C91E", "#FD7E14", "#5C7CFA",
+]
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _wrap_label(text: str, width: int = 15, max_lines: int = 4) -> str:
+    """Word-wrap `text` onto multiple lines (joined with <br>) so long
+    site names stay confined inside their own tile instead of
+    overflowing into neighboring tiles. Truncates with an ellipsis past
+    `max_lines` rather than letting very long names grow the box."""
+    lines = textwrap.wrap(str(text), width=width, break_long_words=False)
+    if not lines:
+        return str(text)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip(".") + "…"
+    return "<br>".join(lines)
+
+
+def _format_flw_hover_block(sub: pd.DataFrame, max_rows_per_col: int = 14, max_cols: int = 6) -> str:
+    """One "name: **count**" line per FLW, sorted ascending (already
+    sorted by the caller) — every FLW is listed, with no cap. The count
+    is styled bold + blue so it stands out from the FLW name. Once a
+    site has more FLWs than fit in a single column (`max_rows_per_col`),
+    the list spreads across additional side-by-side columns — 2, 3,
+    4... up to `max_cols` — so it grows wider rather than indefinitely
+    taller, though a very large site can still end up with a tall,
+    multi-column block."""
+    entries = []
+    for _, r in sub.iterrows():
+        flag = " ⚠️" if r["total"] == 0 else ""
+        value = f"<span style='color:#1565C0;font-weight:700'>{int(r['total']):,}</span>"
+        entries.append(f"{html.escape(str(r['flw_username']))}: {value}{flag}")
+
+    if len(entries) <= max_rows_per_col:
+        return "<br>".join(entries)
+
+    n_cols = min(max_cols, math.ceil(len(entries) / max_rows_per_col))
+    rows_per_col = math.ceil(len(entries) / n_cols)
+    cols = [entries[i * rows_per_col:(i + 1) * rows_per_col] for i in range(n_cols)]
+    # No padding needed after the last (rightmost) column.
+    col_widths = [max((len(e) for e in col), default=0) + 3 for col in cols[:-1]]
+
+    lines = []
+    for row_i in range(rows_per_col):
+        parts = []
+        for c, col in enumerate(cols):
+            if row_i < len(col):
+                cell = col[row_i]
+                if c < len(cols) - 1:
+                    cell = cell.ljust(col_widths[c])
+                parts.append(cell)
+        lines.append("".join(parts))
+    return "<br>".join(lines)
+
+
+def _fig_single_site_flw_detail(site: str, sub: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
+    """Full-detail per-FLW case-count bar chart for a single site — used
+    when the sidebar's "Site" filter has narrowed the grid down to
+    exactly one site. Every FLW gets its own bar with the count printed
+    directly on it, so there's no dependence on hover at all: this
+    sidesteps the exact failure mode that made hover unreliable for a
+    single large site (e.g. Thanjavur's 41 FLWs) — the numbers are just
+    always visible, for however many FLWs the site has, no cap. The
+    chart's height scales with the FLW count, so a big site naturally
+    renders as a big chart rather than being squeezed into one small
+    tile. Sorted descending (lowest-recruiting, most likely
+    underperforming FLWs first in the data) — Plotly's default
+    category-axis ordering places the first row at the bottom of a
+    horizontal bar chart, so this puts the lowest count at the top of
+    the chart and the highest count at the bottom."""
+    plot_df = sub.sort_values("total", ascending=False)
+    n_flw = len(plot_df)
+    total_cases = int(plot_df["total"].sum())
+    ratio = (total_cases / n_flw) if n_flw else 0.0
+    ratio_per_week = ratio / weeks if weeks else ratio
+
+    fig = go.Figure(go.Bar(
+        y=plot_df["flw_username"], x=plot_df["total"], orientation="h",
+        marker_color="#4C6EF5",
+        text=plot_df["total"].apply(lambda v: f"{int(v):,}"),
+        textposition="outside",
+        textfont=dict(size=12, color="black"),
+        hovertemplate="<b>%{y}</b><br>Cases: <b>%{x:,}</b><extra></extra>",
+    ))
+    max_val = float(plot_df["total"].max()) if n_flw else 0.0
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"<b>{html.escape(str(site))}</b> — {n_flw} FLW(s) · "
+                f"{total_cases:,} cases · <b>{ratio_per_week:.2f}</b> cases/FLW/week"
+            ),
+            font=dict(size=14, color="#333"),
+            x=0,
+        ),
+        height=max(320, 26 * n_flw + 120),
+        margin=dict(t=60, b=30, l=10, r=50),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+        xaxis=dict(
+            title=dict(text="Cases", font=dict(color="black")),
+            range=[0, max_val * 1.15 + 1],
+            tickfont=dict(size=11, color="black"),
+            showgrid=True, gridcolor="#f0f0f0", zeroline=False,
+        ),
+        yaxis=dict(
+            automargin=True,
+            tickfont=dict(size=11, color="black"),
+        ),
+    )
+    return fig
+
+
+def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
+    """Grid of one colorful box per site — wrapped site name, active-FLW
+    count, and cases/FLW/week rate shown directly on the box (no hover
+    needed for those). Hovering a box additionally lists every FLW at
+    that site and their case count for the window, sorted ascending so
+    the lowest-recruiting (most likely underperforming) FLWs appear
+    first. Tiles are laid out in descending order of active-FLW count,
+    filled row by row, so the top row holds the highest-FLW sites, the
+    next row the mid-range sites, and the last row the lowest.
+
+    When the filtered data has exactly one site (e.g. the sidebar's
+    "Site" filter is set to a specific site), this returns a full
+    per-FLW detail bar chart instead of a 1-tile grid — see
+    `_fig_single_site_flw_detail`."""
+    if stats.empty:
+        return go.Figure()
+
+    site_flw_counts = stats.groupby("site_full_id")["flw_username"].nunique().sort_values(
+        ascending=False
+    )
+    site_order = site_flw_counts.index.tolist()
+    n_sites = len(site_order)
+
+    if n_sites == 1:
+        site = site_order[0]
+        sub = stats.loc[stats["site_full_id"] == site]
+        return _fig_single_site_flw_detail(site, sub, weeks)
+
+    n_cols = min(4, n_sites) or 1
+    n_rows = math.ceil(n_sites / n_cols)
+    max_flw_at_a_site = int(site_flw_counts.max()) if n_sites else 0
+
+    # Annotation font sizes are fixed pixel values in Plotly, so a tile's
+    # text doesn't reflow the way HTML/CSS text does when the browser
+    # window is resized — only the tile's rendered pixel width changes.
+    # The number of grid columns is what actually determines that
+    # per-tile width (a fixed-width row split N ways), so we scale font
+    # size down as columns increase — the closest practical proxy for
+    # "shrink the text so it still fits the box" without a live
+    # container-width signal at figure-build time.
+    _font_by_cols = {1: (15, 22, 15), 2: (14, 20, 14), 3: (13, 19, 13)}
+    site_font, flw_font, ratio_font = _font_by_cols.get(n_cols, (12, 17, 12))
+
+    # Pre-compute each site's cases/FLW/week rate first, so the darkest
+    # blue in the grid always maps to the highest rate present (rather
+    # than some fixed, possibly-wrong scale) — same "sample the
+    # colorscale by each cell's own fraction of the max" approach used
+    # for the confusion-matrix grid.
+    site_rates = {}
+    for site in site_order:
+        sub = stats.loc[stats["site_full_id"] == site]
+        n_flw = len(sub)
+        total_cases = int(sub["total"].sum())
+        ratio = (total_cases / n_flw) if n_flw else 0.0
+        site_rates[site] = ratio / weeks if weeks else ratio
+    rate_max = max(site_rates.values()) if site_rates else 0.0
+
+    pad = 0.06
+    shapes, annotations = [], []
+    z_grid = [[np.nan] * n_cols for _ in range(n_rows)]
+    text_grid = [[""] * n_cols for _ in range(n_rows)]
+
+    for idx, site in enumerate(site_order):
+        row, col = divmod(idx, n_cols)
+        xi, yi = col, row
+        sub = stats.loc[stats["site_full_id"] == site].sort_values("total")
+        n_flw = len(sub)
+        total_cases = int(sub["total"].sum())
+        ratio_per_week = site_rates[site]
+
+        frac = (ratio_per_week / rate_max) if rate_max else 0.0
+        fill = pcolors.sample_colorscale("Blues", [frac])[0]
+        text_color = "#FFFFFF" if frac > 0.55 else "#222222"
+        muted_text_color = "rgba(255,255,255,0.85)" if frac > 0.55 else "#555555"
+
+        header = [
+            f"<b>{html.escape(str(site))}</b>",
+            f"{n_flw} active FLW(s) · {total_cases:,} cases · {ratio_per_week:.2f} cases/FLW/week",
+            "—",
+        ]
+        hover_text = "<br>".join(header) + "<br>" + _format_flw_hover_block(sub)
+        z_grid[row][col] = 1
+        text_grid[row][col] = hover_text
+
+        x0, x1 = xi - 0.5 + pad, xi + 0.5 - pad
+        y0, y1 = yi - 0.5 + pad, yi + 0.5 - pad
+        shapes.append(dict(
+            type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=y0, y1=y1,
+            line=dict(color="rgba(0,0,0,0.15)", width=1), fillcolor=fill,
+        ))
+        annotations.append(dict(
+            x=xi, y=yi - 0.32, text=_wrap_label(site),
+            showarrow=False, font=dict(size=site_font, color=text_color, family="Arial Black"),
+            align="center", yanchor="top",
+        ))
+        annotations.append(dict(
+            x=xi, y=yi + 0.12, text=f"<b>{n_flw} FLWs</b>",
+            showarrow=False, font=dict(size=flw_font, color=text_color, family="Arial Black"),
+            yanchor="middle",
+        ))
+        annotations.append(dict(
+            x=xi, y=yi + 0.42, text=f"<b>{ratio_per_week:.2f} cases/FLW/week</b>",
+            showarrow=False, font=dict(size=ratio_font, color=muted_text_color, family="Arial Black"),
+            yanchor="bottom",
+        ))
+
+    fig = go.Figure()
+    # A heatmap trace (fully transparent) instead of fixed-pixel-size
+    # scatter markers — its hit area exactly matches each cell's data-space
+    # bounding box, so hover fires reliably across the whole tile
+    # regardless of container width, rather than only inside a fixed-size
+    # marker that may not fully cover a tile at some screen widths.
+    #
+    # One phantom coordinate is appended past the last column and past
+    # the last row (z/text = NaN/"" so it's never drawn). Plotly derives
+    # each cell's hover hit-area from the gap between consecutive x/y
+    # coordinates; with only a single column and/or single row there's
+    # no second coordinate to measure a gap against, and that axis's
+    # hit-area can collapse to zero width. The phantom point sits just
+    # outside the visible axis range set below, so it's never itself
+    # seen or hoverable — it only gives the gap calculation something
+    # to work with. (The n_sites == 1 case is now handled by the bar
+    # chart above and never reaches this code path, but the padding is
+    # kept here too since a 1-row or 1-column *multi-site* grid, e.g. 2
+    # or 3 sites total, is still possible.)
+    x_coords = list(range(n_cols)) + [n_cols]
+    y_coords = list(range(n_rows)) + [n_rows]
+    z_grid = [row + [np.nan] for row in z_grid] + [[np.nan] * (n_cols + 1)]
+    text_grid = [row + [""] for row in text_grid] + [[""] * (n_cols + 1)]
+    fig.add_trace(go.Heatmap(
+        z=z_grid, x=x_coords, y=y_coords,
+        text=text_grid, hovertemplate="%{text}<extra></extra>",
+        colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0)"]],
+        zmin=0, zmax=1, showscale=False,
+        hoverlabel=dict(
+            align="left", bgcolor="white",
+            font=dict(size=12, family="Courier New, monospace"),
+        ),
+    ))
+    fig.update_layout(
+        height=max(210 * n_rows + 30, 130 + 16 * min(max_flw_at_a_site, 30)),
+        margin=dict(t=40, b=10, l=10, r=10),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        xaxis=dict(range=[-0.5, n_cols - 0.5], visible=False, constrain="domain"),
+        yaxis=dict(
+            range=[n_rows - 0.5, -0.5], visible=False,
+            scaleanchor="x", scaleratio=1, constrain="domain",
+        ),
+        annotations=annotations,
+        shapes=shapes,
+    )
+    return fig
 
 
 def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
@@ -659,6 +1018,196 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
             )
         else:
             st.info("No AI-override data available for the current filters.")
+
+        st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
+
+        site_stats, site_window_lbl, site_weeks = _site_flw_activity_stats(df_all)
+        site_suffix = f" — {site_window_lbl}" if site_window_lbl else ""
+        total_flws = int(site_stats["flw_username"].nunique()) if not site_stats.empty else 0
+        st.markdown(
+            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
+            "min-height:40px;'>"
+            f"🧑‍🤝‍🧑 FLWs by site{site_suffix} ({total_flws} FLWs total) "
+            "<span style='font-size:11px;font-weight:500;color:#888;font-style:italic;'>"
+            "(hover a box for per-FLW case counts, lowest first)</span></div>",
+            unsafe_allow_html=True,
+        )
+        fig_site_grid = _fig_site_flw_grid(site_stats, site_weeks)
+        if fig_site_grid.data:
+            # Key includes the grid's shape (rows/cols/site set) rather than
+            # a fixed string. This chart is a Heatmap whose grid dimensions,
+            # axis ranges, and per-cell hover text all change size when a
+            # global filter (site/date/gender) narrows the site list.
+            # Streamlit reuses the existing Plotly div and does an in-place
+            # Plotly.react() update when the key is unchanged — for a
+            # Heatmap that changed shape, the hover hit-testing can end up
+            # stale/dead after that in-place update. Varying the key with
+            # the data forces Streamlit to fully remount the component on
+            # a filter change instead, so hover keeps working.
+            grid_sites = tuple(sorted(site_stats["site_full_id"].astype(str).unique()))
+            grid_key = "lb_site_flw_grid_" + hashlib.md5(
+                "|".join(grid_sites).encode("utf-8")
+            ).hexdigest()[:10]
+            st.plotly_chart(
+                fig_site_grid, width="stretch", key=grid_key,
+                config={"displaylogo": False},
+            )
+        else:
+            st.info("No FLW activity available for the last 3 months.")
+
+
+# ════════════════════════════════════════════════════════════════════
+# AI Inference — phase-2 confusion matrix (AI Result vs TSD Suspicion)
+# ════════════════════════════════════════════════════════════════════
+
+def _ai_inference_confusion(df_p2: pd.DataFrame) -> dict:
+    """Confusion-matrix counts for phase-2 AI Inference: AI Result
+    (prediction) vs the TSD's Suspicion field (ground truth) — "Suspicious"
+    is the positive class on both sides. Restricted to rows with a valid
+    AI Result ("Suspicious" / "Non suspicious") AND a completed TSD review
+    (provisional_diagnosis present) — this matches the "Total TSD" count
+    used by the phase-2 sankey in the Monitoring Dashboard. (Not the
+    stricter phase-1 "reviewed" definition, which also requires `risk` —
+    that field is typically blank for non-suspicious TSD reads and would
+    undercount true negatives.)"""
+    empty = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    if df_p2.empty:
+        return empty
+    ai_col = _ai_result_col(df_p2)
+    if ai_col is None or "provisional_diagnosis" not in df_p2.columns:
+        return empty
+
+    ai_s_m  = _present_mask(df_p2[ai_col]) & _norm(df_p2[ai_col]).eq("suspicious")
+    ai_ns_m = _present_mask(df_p2[ai_col]) & _norm(df_p2[ai_col]).eq("non suspicious")
+    tsd_reviewed = _present_mask(df_p2["provisional_diagnosis"])
+    ground_truth_susp = (
+        _norm(df_p2["suspicion"]).eq("suspicious")
+        if "suspicion" in df_p2.columns
+        else pd.Series(False, index=df_p2.index)
+    )
+
+    tp = int((ai_s_m  &  ground_truth_susp & tsd_reviewed).sum())
+    fp = int((ai_s_m  & ~ground_truth_susp & tsd_reviewed).sum())
+    fn = int((ai_ns_m &  ground_truth_susp & tsd_reviewed).sum())
+    tn = int((ai_ns_m & ~ground_truth_susp & tsd_reviewed).sum())
+    return {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+def _fig_confusion_matrix(conf: dict, n_total: int) -> go.Figure:
+    """3x3 confusion-matrix grid: AI Result (rows) vs TSD Diagnosis /
+    Suspicion (columns), with an extra "Total" row and column. Every
+    cell — core and total alike — is drawn as its own rect shape using
+    one shared inset formula, so all 9 boxes render at exactly the same
+    size. Core cells are filled with a smooth blue gradient scaled by
+    count (darker = higher count), with text color independently
+    switched to light-on-dark or dark-on-light based on that cell's own
+    shade. Total cells are transparent (no fill) with a thin outline and
+    plain dark text."""
+    tp, fp, fn, tn = conf["tp"], conf["fp"], conf["fn"], conf["tn"]
+
+    core = [[tp, fp], [fn, tn]]
+    zmax = max(max(row) for row in core) or 1
+    pct = [[(v / n_total * 100 if n_total else 0.0) for v in row] for row in core]
+    row_totals = [tp + fp, fn + tn]
+    col_totals = [tp + fn, fp + tn]
+
+    x_labels = ["TSD: Suspicious", "TSD: Non-suspicious", "Total"]
+    y_labels = ["AI: Suspicious", "AI: Non-suspicious", "Total"]
+
+    pad = 0.05  # shared inset (in cell units) applied to every box, core and total alike
+
+    def _box(xi: int, yi: int):
+        return xi - 0.5 + pad, xi + 0.5 - pad, yi - 0.5 + pad, yi + 0.5 - pad
+
+    shapes, annotations = [], []
+
+    # Core 2x2 cells — filled with a Blues shade sampled from each cell's
+    # own count fraction, so the box itself carries the gradient.
+    for yi in range(2):
+        for xi in range(2):
+            v = core[yi][xi]
+            frac = v / zmax
+            fill = pcolors.sample_colorscale("Blues", [frac])[0]
+            font_color = "#FFFFFF" if frac > 0.55 else "#111111"
+            x0, x1, y0, y1 = _box(xi, yi)
+            shapes.append(dict(
+                type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=y0, y1=y1,
+                line=dict(color="rgba(0,0,0,0)", width=0), fillcolor=fill,
+            ))
+            annotations.append(dict(
+                x=xi, y=yi, text=f"<b>{v:,}</b><br>{pct[yi][xi]:.1f}%",
+                showarrow=False, font=dict(size=22, color=font_color, family="Arial Black"),
+            ))
+
+    # Total row (x=2), total column (y=2), and grand total (x=2, y=2) —
+    # same box size as the core cells, transparent fill, thin outline.
+    def _total_box(xi: int, yi: int, text: str):
+        x0, x1, y0, y1 = _box(xi, yi)
+        shapes.append(dict(
+            type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=y0, y1=y1,
+            line=dict(color="#cccccc", width=1.5), fillcolor="rgba(0,0,0,0)",
+        ))
+        annotations.append(dict(
+            x=xi, y=yi, text=f"<b>{text}</b>", showarrow=False,
+            font=dict(size=20, color="#333333", family="Arial Black"),
+        ))
+
+    for yi in range(2):
+        _total_box(2, yi, f"{row_totals[yi]:,}")
+    for xi in range(2):
+        _total_box(xi, 2, f"{col_totals[xi]:,}")
+    _total_box(2, 2, f"{n_total:,}")
+
+    fig = go.Figure()
+    fig.update_layout(
+        height=520,
+        margin=dict(t=10, b=10, l=10, r=10),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        xaxis=dict(
+            range=[-0.5, 2.5], tickmode="array", tickvals=[0, 1, 2], ticktext=x_labels,
+            side="top", tickfont=dict(size=14, color="#333", family="Arial Black"),
+            showgrid=False, zeroline=False, constrain="domain",
+        ),
+        yaxis=dict(
+            range=[2.5, -0.5], tickmode="array", tickvals=[0, 1, 2], ticktext=y_labels,
+            tickfont=dict(size=14, color="#333", family="Arial Black"),
+            showgrid=False, zeroline=False,
+            scaleanchor="x", scaleratio=1, constrain="domain",
+        ),
+        annotations=annotations,
+        shapes=shapes,
+    )
+    return fig
+
+
+def _render_ai_inference(df_p2: pd.DataFrame) -> None:
+    """AI Inference tab: phase-2 confusion matrix (AI Result vs TSD
+    Suspicion), with row/column totals."""
+    conf = _ai_inference_confusion(df_p2)
+    n_total = conf["tp"] + conf["fp"] + conf["fn"] + conf["tn"]
+    if n_total == 0:
+        st.info(
+            "No phase-2 cases with both an AI Result and a completed TSD "
+            "review are available for the current filters."
+        )
+        return
+
+    st.markdown(
+        "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
+        "🧩 Confusion Matrix — AI vs TSD</div>",
+        unsafe_allow_html=True,
+    )
+    fig_conf = _fig_confusion_matrix(conf, n_total)
+    st.plotly_chart(
+        fig_conf, width="stretch", key="ai_inference_confusion",
+        config={"displaylogo": False},
+    )
+    st.markdown(
+        f"<div style='text-align:center;margin-top:-6px;font-size:13px;color:#888;'>"
+        f"n = {n_total:,} phase-2 cases with a completed TSD review</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -805,6 +1354,39 @@ def _render_site_table(df: pd.DataFrame) -> None:
             "</tr>"
         )
 
+    # Totals row — summed across every site currently in the table.
+    # Current-month total only counts sites that aren't "stopped" (those
+    # show "–" per-row and are excluded from the sum, same as their cell).
+    total_cur_screened = sum(
+        int(cur_month_by_site.get(site, 0))
+        for site in sites_present
+        if not is_stopped(site)
+    )
+    total_screened = int(screened_by_site.sum())
+    total_susp = int(suspicious_by_site.sum())
+    total_high = int(high_by_site.sum())
+    total_susp_pct = round(total_susp / total_screened * 100, 1) if total_screened else 0.0
+    total_high_pct = round(total_high / total_screened * 100, 1) if total_screened else 0.0
+
+    totals_row_html = (
+        "<tr style='background:#fafafa;'>"
+        "<td style='padding:6px 10px;text-align:left;font-weight:800;"
+        "color:#333;border-top:2px solid #ddd;'>Total</td>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        "color:#999;border-top:2px solid #ddd;'>–</td>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        "color:#999;border-top:2px solid #ddd;'>–</td>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        f"color:#4CA64C;border-top:2px solid #ddd;'>{total_cur_screened:,}</td>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        f"color:#228B22;border-top:2px solid #ddd;'>{total_screened:,}</td>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        f"color:#F4A900;border-top:2px solid #ddd;'>{total_susp:,} ({total_susp_pct}%)</td>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        f"color:#D94040;border-top:2px solid #ddd;'>{total_high:,} ({total_high_pct}%)</td>"
+        "</tr>"
+    )
+
     table_html = (
         "<div style='overflow-x:auto;'>"
         "<table style='width:100%;border-collapse:collapse;background:#fff;"
@@ -831,7 +1413,7 @@ def _render_site_table(df: pd.DataFrame) -> None:
         "<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
         "color:#D94040;'>High Risk</th>"
-        "</tr></thead><tbody>" + "".join(rows_html) + "</tbody></table></div>"
+        "</tr></thead><tbody>" + "".join(rows_html) + totals_row_html + "</tbody></table></div>"
     )
 
     st.markdown(table_html, unsafe_allow_html=True)
@@ -876,7 +1458,8 @@ def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> No
         <style>
         /* Make the research tab buttons look exactly like the monitoring tabs */
         .st-key-btn_research_descriptive button,
-        .st-key-btn_research_leaderboard button {
+        .st-key-btn_research_leaderboard button,
+        .st-key-btn_research_ai_inference button {
             padding: 10px 12px !important;
             font-size: 22px !important;
             font-weight: 800 !important;
@@ -884,7 +1467,8 @@ def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> No
             line-height: 1.3 !important;
         }
         .st-key-btn_research_descriptive button *,
-        .st-key-btn_research_leaderboard button * {
+        .st-key-btn_research_leaderboard button *,
+        .st-key-btn_research_ai_inference button * {
             font-weight: 800 !important;
         }
         </style>
@@ -895,8 +1479,8 @@ def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> No
     if "research_tab" not in st.session_state:
         st.session_state.research_tab = 0
 
-    # ── Tab button row — Descriptive · Leaderboard ──
-    col1, col2, _sp = st.columns([1, 1, 4])
+    # ── Tab button row — Descriptive · Leaderboard · AI Inference ──
+    col1, col2, col3, _sp = st.columns([1, 1, 1, 3])
     with col1:
         if st.button(
             "📊 Descriptive",
@@ -915,6 +1499,15 @@ def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> No
         ):
             st.session_state.research_tab = 1
             st.rerun()
+    with col3:
+        if st.button(
+            "🧠 AI Inference",
+            key="btn_research_ai_inference",
+            type="primary" if st.session_state.research_tab == 2 else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state.research_tab = 2
+            st.rerun()
 
     st.markdown(
         "<hr style='border:none;border-top:1.5px solid #ddd;margin:10px 0 18px;'>",
@@ -927,11 +1520,16 @@ def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> No
             st.info("No data available for the current filters.")
         else:
             _render_site_table(df_all)
-    else:
+    elif st.session_state.research_tab == 1:
         if df_all.empty and df_p2.empty:
             st.info("No data available for the current filters.")
         else:
             _render_leaderboard(df_all, df_p2)
+    else:
+        if df_p2.empty:
+            st.info("No AI-Enabled Screening (phase-2) data available for the current filters.")
+        else:
+            _render_ai_inference(df_p2)
 
     # ── Footer with email (matching monitoring dashboard style) ──
     st.markdown("---")

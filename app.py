@@ -826,6 +826,12 @@ def _date_window_mask(
         end = anchor
         return mask & (dates >= start) & (dates <= end)
 
+    if window == "Current month":
+        anchor = pd.Timestamp(anchor)
+        start = anchor.to_period("M").start_time
+        end = anchor
+        return mask & (dates >= start) & (dates <= end)
+
     if window == "Last 3 months":
         anchor = pd.Timestamp(anchor)
         start = (anchor.to_period("M") - 2).start_time
@@ -1000,7 +1006,7 @@ def main() -> None:
 
     quick_window = st.sidebar.selectbox(
         "🗓️ Quick date filter",
-        ["All data", "Last 6 months", "Last 3 months"],
+        ["All data", "Current month", "Last 3 months", "Last 6 months"],
         key=f"qw_{_f}",
     )
 
