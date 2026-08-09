@@ -843,8 +843,8 @@ def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
     # size down as columns increase — the closest practical proxy for
     # "shrink the text so it still fits the box" without a live
     # container-width signal at figure-build time.
-    _font_by_cols = {1: (15, 22, 15), 2: (14, 20, 14), 3: (13, 19, 13)}
-    site_font, flw_font, ratio_font = _font_by_cols.get(n_cols, (12, 17, 12))
+    _font_by_cols = {1: (12, 17, 12), 2: (11, 16, 11), 3: (10, 15, 10)}
+    site_font, flw_font, ratio_font = _font_by_cols.get(n_cols, (9, 13, 9))
 
     # Pre-compute each site's cases/FLW/week rate first, so the darkest
     # blue in the grid always maps to the highest rate present (rather
@@ -944,13 +944,24 @@ def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
     ))
     fig.update_layout(
         height=max(210 * n_rows + 30, 130 + 16 * min(max_flw_at_a_site, 30)),
-        margin=dict(t=40, b=10, l=10, r=10),
+        width=230 * n_cols + 30,
+        autosize=False,
+        margin=dict(t=2, b=10, l=10, r=10),
         plot_bgcolor="white",
         paper_bgcolor="white",
-        xaxis=dict(range=[-0.5, n_cols - 0.5], visible=False, constrain="domain"),
+        # No fixedrange here (matches every other chart in this dashboard,
+        # so the full zoom/pan/autoscale toolbar shows up as normal) and
+        # an explicit, non-stretching width+height above instead — this
+        # grid is shapes/annotations at fixed data coordinates, not a
+        # data-driven trace, so letting Streamlit stretch it to a
+        # variable container width (e.g. when its native fullscreen
+        # toggle resizes the container) was what made the tiles collapse
+        # into an overlapping cluster. A fixed pixel size sidesteps that
+        # resize path entirely — the plot renders identically no matter
+        # what container it's placed in.
+        xaxis=dict(range=[-0.5, n_cols - 0.5], visible=False),
         yaxis=dict(
             range=[n_rows - 0.5, -0.5], visible=False,
-            scaleanchor="x", scaleratio=1, constrain="domain",
         ),
         annotations=annotations,
         shapes=shapes,
@@ -1023,13 +1034,21 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
 
         site_stats, site_window_lbl, site_weeks = _site_flw_activity_stats(df_all)
         site_suffix = f" — {site_window_lbl}" if site_window_lbl else ""
-        total_flws = int(site_stats["flw_username"].nunique()) if not site_stats.empty else 0
+        # Sum of each site's unique-FLW count (i.e. count an FLW once per
+        # site they're active at), matching what the tiles below add up
+        # to — not a single global nunique(), which would dedupe an FLW
+        # who appears at multiple sites down to one and undercount the
+        # title relative to the tiles.
+        total_flws = int(
+            site_stats.groupby("site_full_id")["flw_username"].nunique().sum()
+        ) if not site_stats.empty else 0
         st.markdown(
             "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
             "min-height:40px;'>"
             f"🧑‍🤝‍🧑 FLWs by site{site_suffix} ({total_flws} FLWs total) "
             "<span style='font-size:11px;font-weight:500;color:#888;font-style:italic;'>"
-            "(hover a box for per-FLW case counts, lowest first)</span></div>",
+            "(hover a box for per-FLW case counts, lowest first)</span></div>"
+            "<div style='margin-bottom:-10px;'></div>",
             unsafe_allow_html=True,
         )
         fig_site_grid = _fig_site_flw_grid(site_stats, site_weeks)
@@ -1049,7 +1068,15 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
                 "|".join(grid_sites).encode("utf-8")
             ).hexdigest()[:10]
             st.plotly_chart(
-                fig_site_grid, width="stretch", key=grid_key,
+                fig_site_grid, width="content", key=grid_key,
+                # width="content" (not "stretch") plus the fixed
+                # width/height + autosize=False set on the figure itself
+                # (see _fig_site_flw_grid) means this chart is never
+                # asked to resize to fit a variable-width container. That
+                # container-resize path — triggered either by clicking
+                # Plotly's own Autoscale button or by Streamlit's native
+                # per-chart fullscreen toggle — is what was collapsing
+                # the tiles into an overlapping cluster.
                 config={"displaylogo": False},
             )
         else:
