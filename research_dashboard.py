@@ -35,6 +35,7 @@ import pandas as pd
 import plotly.colors as pcolors
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 AMBER_HIGH = "#E0631A"
 AMBER_LOW  = "#F7C548"
@@ -946,7 +947,14 @@ def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
         height=max(210 * n_rows + 30, 130 + 16 * min(max_flw_at_a_site, 30)),
         width=230 * n_cols + 30,
         autosize=False,
-        margin=dict(t=2, b=10, l=10, r=10),
+        # l > r (rather than equal) shifts the whole plot area — and
+        # everything drawn in data coordinates within it (tiles, text) —
+        # a bit to the right inside the fixed-width canvas, without
+        # resizing anything: increasing the left margin moves the plot
+        # area's left edge right, and decreasing the right margin by the
+        # same amount moves its right edge right too, so the tiles slide
+        # right as a block instead of stretching.
+        margin=dict(t=2, b=10, l=25, r=0),
         plot_bgcolor="white",
         paper_bgcolor="white",
         # No fixedrange here (matches every other chart in this dashboard,
@@ -1067,17 +1075,76 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
             grid_key = "lb_site_flw_grid_" + hashlib.md5(
                 "|".join(grid_sites).encode("utf-8")
             ).hexdigest()[:10]
-            st.plotly_chart(
-                fig_site_grid, width="content", key=grid_key,
-                # width="content" (not "stretch") plus the fixed
-                # width/height + autosize=False set on the figure itself
-                # (see _fig_site_flw_grid) means this chart is never
-                # asked to resize to fit a variable-width container. That
-                # container-resize path — triggered either by clicking
-                # Plotly's own Autoscale button or by Streamlit's native
-                # per-chart fullscreen toggle — is what was collapsing
-                # the tiles into an overlapping cluster.
-                config={"displaylogo": False},
+            # The chart is still a fixed-pixel canvas (see the comment on
+            # width="content" below — that hasn't changed, and neither
+            # has the box/tile size). A plain CSS override on the SVG
+            # text's inline style didn't reliably stick (Plotly re-applies
+            # its own inline font-size, and browsers can prioritise it
+            # over an author stylesheet even with !important depending on
+            # how/when it's re-rendered), so this uses a small JS snippet
+            # instead: it finds this chart's actual <text> nodes in the
+            # live DOM and sets their font-size directly, in proportion to
+            # the current window width. Box/tile sizes (the shapes) are
+            # untouched — only the text nodes are targeted.
+            st.markdown(
+                '<style>.st-key-flw_site_grid_wrap { margin-left: 14px; }</style>',
+                unsafe_allow_html=True,
+            )
+            with st.container(key="flw_site_grid_wrap"):
+                st.plotly_chart(
+                    fig_site_grid, width="content", key=grid_key,
+                    # width="content" (not "stretch") plus the fixed
+                    # width/height + autosize=False set on the figure itself
+                    # (see _fig_site_flw_grid) means this chart is never
+                    # asked to resize to fit a variable-width container. That
+                    # container-resize path — triggered either by clicking
+                    # Plotly's own Autoscale button or by Streamlit's native
+                    # per-chart fullscreen toggle — is what was collapsing
+                    # the tiles into an overlapping cluster.
+                    config={"displaylogo": False},
+                )
+            components.html(
+                """
+                <script>
+                (function() {
+                    const doc = window.parent.document;
+
+                    function scaleFonts() {
+                        const wrap = doc.querySelector('.st-key-flw_site_grid_wrap');
+                        if (!wrap) return;
+                        const texts = wrap.querySelectorAll('svg text');
+                        if (!texts.length) return;
+
+                        const w = window.parent.innerWidth;
+                        let mult = 1.0;
+                        if (w >= 2200) mult = 1.5;
+                        else if (w >= 1800) mult = 1.35;
+                        else if (w >= 1400) mult = 1.18;
+
+                        texts.forEach(function(t) {
+                            if (!t.dataset.baseSize) {
+                                const current = parseFloat(t.style.fontSize) ||
+                                    parseFloat(window.parent.getComputedStyle(t).fontSize) || 12;
+                                t.dataset.baseSize = current;
+                            }
+                            const base = parseFloat(t.dataset.baseSize);
+                            t.style.setProperty('font-size', (base * mult) + 'px', 'important');
+                        });
+                    }
+
+                    // Plotly renders asynchronously after Streamlit inserts
+                    // the component, and can re-render on filter changes —
+                    // a MutationObserver + resize listener keeps the sizing
+                    // correct across both, instead of a one-off call.
+                    scaleFonts();
+                    const observer = new MutationObserver(scaleFonts);
+                    observer.observe(doc.body, {childList: true, subtree: true});
+                    window.parent.addEventListener('resize', scaleFonts);
+                })();
+                </script>
+                """,
+                height=0,
+                width=0,
             )
         else:
             st.info("No FLW activity available for the last 3 months.")
