@@ -35,7 +35,6 @@ import pandas as pd
 import plotly.colors as pcolors
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 
 AMBER_HIGH = "#E0631A"
 AMBER_LOW  = "#F7C548"
@@ -973,6 +972,12 @@ def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
         ),
         annotations=annotations,
         shapes=shapes,
+        # Stashes the exact base pixel sizes used above so the JS
+        # font-scaler in _render_leaderboard can multiply from the real
+        # Python-computed values instead of trying to read them back out
+        # of the DOM (which — depending on exactly when it reads —
+        # can race Plotly's own rendering and lock in the wrong number).
+        meta=dict(site_font=site_font, flw_font=flw_font, ratio_font=ratio_font),
     )
     return fig
 
@@ -1078,14 +1083,22 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
             # The chart is still a fixed-pixel canvas (see the comment on
             # width="content" below — that hasn't changed, and neither
             # has the box/tile size). A plain CSS override on the SVG
-            # text's inline style didn't reliably stick (Plotly re-applies
-            # its own inline font-size, and browsers can prioritise it
-            # over an author stylesheet even with !important depending on
-            # how/when it's re-rendered), so this uses a small JS snippet
-            # instead: it finds this chart's actual <text> nodes in the
-            # live DOM and sets their font-size directly, in proportion to
-            # the current window width. Box/tile sizes (the shapes) are
-            # untouched — only the text nodes are targeted.
+            # text's inline style didn't reliably stick, and neither did
+            # matching on the text element's rendered font-family string
+            # (Plotly doesn't necessarily serialize it back out verbatim),
+            # so this selects text a third way instead: Plotly renders
+            # each annotation as its own <g class="annotation"
+            # data-index="N"> in the exact order fig.layout.annotations
+            # was built in Python — 3 per site tile, always in the same
+            # site-name / FLW-count / ratio cycle (see the loop in
+            # _fig_site_flw_grid) — so `data-index % 3` reliably tells us
+            # which role a given annotation is, with no dependency on how
+            # Plotly happens to format text/style attributes.
+            fig_meta = fig_site_grid.layout.meta or {}
+            base_site_font = float(fig_meta.get("site_font", 9))
+            base_flw_font = float(fig_meta.get("flw_font", 13))
+            base_ratio_font = float(fig_meta.get("ratio_font", 9))
+
             st.markdown(
                 '<style>.st-key-flw_site_grid_wrap { margin-left: 14px; }</style>',
                 unsafe_allow_html=True,
@@ -1103,17 +1116,20 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
                     # the tiles into an overlapping cluster.
                     config={"displaylogo": False},
                 )
-            components.html(
-                """
+            st.iframe(
+                f"""
                 <script>
-                (function() {
+                (function() {{
                     const doc = window.parent.document;
+                    const BASE_SITE = {base_site_font};
+                    const BASE_FLW = {base_flw_font};
+                    const BASE_RATIO = {base_ratio_font};
 
-                    function scaleFonts() {
+                    function scaleFonts() {{
                         const wrap = doc.querySelector('.st-key-flw_site_grid_wrap');
                         if (!wrap) return;
-                        const texts = wrap.querySelectorAll('svg text');
-                        if (!texts.length) return;
+                        const groups = wrap.querySelectorAll('[data-index]');
+                        if (!groups.length) return;
 
                         const w = window.parent.innerWidth;
                         let mult = 1.0;
@@ -1121,30 +1137,33 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
                         else if (w >= 1800) mult = 1.35;
                         else if (w >= 1400) mult = 1.18;
 
-                        texts.forEach(function(t) {
-                            if (!t.dataset.baseSize) {
-                                const current = parseFloat(t.style.fontSize) ||
-                                    parseFloat(window.parent.getComputedStyle(t).fontSize) || 12;
-                                t.dataset.baseSize = current;
-                            }
-                            const base = parseFloat(t.dataset.baseSize);
-                            t.style.setProperty('font-size', (base * mult) + 'px', 'important');
-                        });
-                    }
+                        groups.forEach(function(g) {{
+                            const idx = parseInt(g.getAttribute('data-index'), 10);
+                            if (isNaN(idx)) return;
+                            const role = idx % 3;
+                            const base = role === 0 ? BASE_SITE : (role === 1 ? BASE_FLW : BASE_RATIO);
+                            g.querySelectorAll('text').forEach(function(t) {{
+                                t.style.setProperty('font-size', (base * mult) + 'px', 'important');
+                            }});
+                        }});
+                    }}
 
                     // Plotly renders asynchronously after Streamlit inserts
                     // the component, and can re-render on filter changes —
                     // a MutationObserver + resize listener keeps the sizing
-                    // correct across both, instead of a one-off call.
+                    // correct across both, instead of a one-off call. Since
+                    // scaleFonts() always recomputes from the fixed BASE_*
+                    // constants (never from the DOM), repeated calls can't
+                    // compound or drift.
                     scaleFonts();
                     const observer = new MutationObserver(scaleFonts);
-                    observer.observe(doc.body, {childList: true, subtree: true});
+                    observer.observe(doc.body, {{childList: true, subtree: true}});
                     window.parent.addEventListener('resize', scaleFonts);
-                })();
+                }})();
                 </script>
                 """,
-                height=0,
-                width=0,
+                height=1,
+                width=1,
             )
         else:
             st.info("No FLW activity available for the last 3 months.")
