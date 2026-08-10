@@ -1296,8 +1296,19 @@ def _render_site_table(df: pd.DataFrame) -> None:
 
     if "date_of_case_registered" in df.columns:
         min_date_by_site = df.groupby(site_key)["date_of_case_registered"].min()
+        max_date_by_site = df.groupby(site_key)["date_of_case_registered"].max()
     else:
         min_date_by_site = pd.Series(dtype="datetime64[ns]")
+        max_date_by_site = pd.Series(dtype="datetime64[ns]")
+
+    # Retrieval date (date-only) per site — the most recent
+    # "retrieval_date_time" seen for that site, from the cron
+    # pipeline's merge step (see merge_data.py).
+    if "retrieval_date_time" in df.columns:
+        retrieval_dt_series = pd.to_datetime(df["retrieval_date_time"], errors="coerce")
+        retrieval_date_by_site = retrieval_dt_series.groupby(site_key).max()
+    else:
+        retrieval_date_by_site = pd.Series(dtype="datetime64[ns]")
 
     # map_site_name for stopped status (optional)
     if "map_site_name" in df.columns:
@@ -1362,6 +1373,12 @@ def _render_site_table(df: pd.DataFrame) -> None:
         min_dt = min_date_by_site.get(site)
         start_date_str = min_dt.strftime('%d-%b-%Y') if pd.notna(min_dt) else "—"
 
+        max_dt_site = max_date_by_site.get(site)
+        recent_date_str = max_dt_site.strftime('%d-%b-%Y') if pd.notna(max_dt_site) else "—"
+
+        retrieval_dt = retrieval_date_by_site.get(site)
+        retrieval_date_str = retrieval_dt.strftime('%d-%b-%Y') if pd.notna(retrieval_dt) else "—"
+
         rows_html.append(
             "<tr>"
             f"<td style='padding:5px 10px;text-align:left;font-weight:600;"
@@ -1369,7 +1386,11 @@ def _render_site_table(df: pd.DataFrame) -> None:
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
             f"color:{site_type_color};border-top:1px solid #eee;white-space:nowrap;'>{html.escape(site_type_str)}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
+            f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(retrieval_date_str)}</td>"
+            f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
             f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(start_date_str)}</td>"
+            f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
+            f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(recent_date_str)}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
             f"color:#4CA64C;border-top:1px solid #eee;'>{cur_screened_display}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
@@ -1404,6 +1425,10 @@ def _render_site_table(df: pd.DataFrame) -> None:
         "<td style='padding:6px 10px;text-align:center;font-weight:800;"
         "color:#999;border-top:2px solid #ddd;'>–</td>"
         "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        "color:#999;border-top:2px solid #ddd;'>–</td>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        "color:#999;border-top:2px solid #ddd;'>–</td>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
         f"color:#4CA64C;border-top:2px solid #ddd;'>{total_cur_screened:,}</td>"
         "<td style='padding:6px 10px;text-align:center;font-weight:800;"
         f"color:#228B22;border-top:2px solid #ddd;'>{total_screened:,}</td>"
@@ -1427,7 +1452,13 @@ def _render_site_table(df: pd.DataFrame) -> None:
         "color:#555;'>Site Type</th>"
         "<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+        "color:#555;'>Retrieval Date</th>"
+        "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+        "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
         "color:#555;'>Start Date</th>"
+        "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+        "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+        "color:#555;'>Recent Date</th>"
         f"<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
         f"color:#4CA64C;'>Screened in<br>{html.escape(last_lbl)}</th>"
