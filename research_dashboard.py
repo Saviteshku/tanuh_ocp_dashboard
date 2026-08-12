@@ -271,6 +271,59 @@ def _current_month_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     return df.loc[mask], max_dt.strftime("%b %Y")
 
 
+def _window_label_and_weeks(df: pd.DataFrame) -> tuple[str, float]:
+    """Label for the actual date range present in `df`'s
+    date_of_case_registered column (e.g. '01 May 2026 - 12 Aug 2026',
+    or just '12 Aug 2026' if start and end are the same day), and the
+    number of weeks that range spans (minimum 1 week). Reflects
+    whatever the sidebar's global date filter has already produced on
+    `df` — no additional lookback window is applied here, so both
+    values update automatically whenever the global filter changes."""
+    if df.empty or "date_of_case_registered" not in df.columns:
+        return "", 1.0
+    dates = df["date_of_case_registered"].dropna()
+    if dates.empty:
+        return "", 1.0
+    min_dt, max_dt = dates.min(), dates.max()
+    start_lbl = min_dt.strftime("%d %b %Y")
+    end_lbl = max_dt.strftime("%d %b %Y")
+    label = end_lbl if start_lbl == end_lbl else f"{start_lbl} - {end_lbl}"
+    weeks = max((max_dt - min_dt).days / 7, 1.0)
+    return label, weeks
+
+
+def _filter_window_label_and_weeks(
+    filter_start, filter_end
+) -> tuple[str, float]:
+    """Label + week-count derived from the sidebar's explicit "Date
+    range" selection itself (`filter_start`/`filter_end`, the actual
+    picked boundary dates) rather than from whichever case dates
+    happen to be present in the filtered data. This is what makes
+    "Current month" mean exactly the 1st of the month through today,
+    and a 7-day range mean exactly 1 week — regardless of whether data
+    exists on the very first or very last day of that range.
+
+    Used as the single shared denominator for cases/week everywhere it
+    needs to match across charts: the same FLW's cases/week comes out
+    identical in the "Top 10 FLWs by cases/week" leaderboard and the
+    "FLWs by site" bar chart, since both now divide by this same
+    filter-derived week count instead of each computing its own
+    (previously data-derived, or per-FLW-span) weeks value.
+
+    Falls back to ("", 1.0) if no filter dates are available (e.g. the
+    dataset has no date column at all)."""
+    if filter_start is None or filter_end is None:
+        return "", 1.0
+    start_ts = pd.Timestamp(filter_start)
+    end_ts = pd.Timestamp(filter_end)
+    start_lbl = start_ts.strftime("%d %b %Y")
+    end_lbl = end_ts.strftime("%d %b %Y")
+    label = end_lbl if start_lbl == end_lbl else f"{start_lbl} - {end_lbl}"
+    days = (end_ts - start_ts).days
+    weeks = max(days, 1) / 7
+    return label, weeks
+
+
 # ════════════════════════════════════════════════════════════════════
 # Leaderboard — per-FLW stats & charts
 # ════════════════════════════════════════════════════════════════════
@@ -341,21 +394,33 @@ def _nice_dtick(range_max: float, target_ticks: int = 5) -> float:
     return magnitude * 10
 
 
-def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.Figure:
-    """Top-10 (FLW, state) pairs by total screened, horizontal stacked bar
-    (highest at top, lowest at bottom). The same flw_username can appear
-    under multiple states, so each pairing gets its own bar, labeled
-    "<flw_username>" then state on the next line on the y-axis. Hover shows
-    the site_full_id plus Non-suspicious / Suspicious·Low risk / Suspicious·High
-    risk counts together — all correctly scoped to that FLW+state pair."""
+def _fig_leaderboard_flw_counts(df: pd.DataFrame, window_label: str = "", weeks: float = 1.0) -> go.Figure:
+    """Top-10 (FLW, state) pairs by cases/week — total screened divided
+    by `weeks` (the number of weeks spanned by whatever data is
+    currently passed in, i.e. the sidebar's global filter — see
+    `_window_label_and_weeks`). The same `weeks` value is used for
+    every FLW, so the ranking order is identical to ranking by raw
+    total; only the displayed scale changes. Horizontal stacked bar
+    (highest at top, lowest at bottom). The same flw_username can
+    appear under multiple states, so each pairing gets its own bar,
+    labeled "<flw_username>" then state on the next line on the
+    y-axis.
+
+    Each stacked segment's bar length is the rate (raw count / weeks),
+    so the whole stack sums to the FLW's cases/week — but the hover
+    for every segment still reports the underlying RAW count (via
+    customdata), same as before; a new "Cases/week" line is added on
+    top of that, showing the FLW's overall rate."""
     stats = _leaderboard_flw_counts(df)
     if stats.empty:
         return go.Figure()
 
+    weeks = weeks if weeks else 1.0
     top = stats.sort_values("total", ascending=False).head(10)
     # Ascending order so the highest bar ends up plotted at the top of a
     # horizontal bar chart (Plotly stacks categories bottom-to-top).
-    plot_df = top.sort_values("total", ascending=True)
+    plot_df = top.sort_values("total", ascending=True).copy()
+    plot_df["rate"] = plot_df["total"] / weeks
 
     fig = go.Figure()
     # Invisible zero-width bar to surface the site_full_id in the unified hover
@@ -372,32 +437,43 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
         customdata=plot_df["total"],
         hovertemplate="Total screened: <b>%{customdata:,}</b><extra></extra>",
     ))
+    # Invisible zero-width bar to surface the FLW's cases/week rate in the unified hover
     fig.add_trace(go.Bar(
-        y=plot_df["label"], x=plot_df["pending"], orientation="h",
+        y=plot_df["label"], x=[0] * len(plot_df), orientation="h",
+        name="Cases/week", marker=dict(color="rgba(0,0,0,0)"), showlegend=False,
+        customdata=plot_df["rate"].apply(lambda v: f"{v:.2f}"),
+        hovertemplate="Cases/week: <b>%{customdata}</b><extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=plot_df["label"], x=plot_df["pending"] / weeks, orientation="h",
         name="Pending review", marker_color="#C9C9C9",
-        hovertemplate="Pending review: <b>%{x:,}</b><extra></extra>",
+        customdata=plot_df["pending"],
+        hovertemplate="Pending review: <b>%{customdata:,}</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        y=plot_df["label"], x=plot_df["non_susp"], orientation="h",
+        y=plot_df["label"], x=plot_df["non_susp"] / weeks, orientation="h",
         name="Non-suspicious", marker_color="#6B6B6B",
-        hovertemplate="Non-suspicious: <b>%{x:,}</b><extra></extra>",
+        customdata=plot_df["non_susp"],
+        hovertemplate="Non-suspicious: <b>%{customdata:,}</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        y=plot_df["label"], x=plot_df["low"], orientation="h",
+        y=plot_df["label"], x=plot_df["low"] / weeks, orientation="h",
         name="Suspicious · Low risk", marker_color=AMBER_LOW,
-        hovertemplate="Suspicious · Low risk: <b>%{x:,}</b><extra></extra>",
+        customdata=plot_df["low"],
+        hovertemplate="Suspicious · Low risk: <b>%{customdata:,}</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        y=plot_df["label"], x=plot_df["high"], orientation="h",
+        y=plot_df["label"], x=plot_df["high"] / weeks, orientation="h",
         name="Suspicious · High risk", marker_color=AMBER_HIGH,
-        hovertemplate="Suspicious · High risk: <b>%{x:,}</b><extra></extra>",
+        customdata=plot_df["high"],
+        hovertemplate="Suspicious · High risk: <b>%{customdata:,}</b><extra></extra>",
     ))
 
-    max_total = float(plot_df["total"].max())
-    # Axis extends to max total screened + 2, so there's a little room
-    # past the highest bar (ticks fall every 2 counts).
-    range_max = max_total + 2
-    x_title = f"Cases screened{f' — {month_label}' if month_label else ''}"
+    max_rate = float(plot_df["rate"].max())
+    # Axis extends a little past the highest bar, same idea as before
+    # but scaled to the rate instead of the raw count.
+    range_max = max_rate * 1.15 + 0.5
+    x_title = f"Cases/week{f' — {window_label}' if window_label else ''}"
     chart_h = max(420, 46 * len(plot_df) + 100)
 
     fig.update_layout(
@@ -418,7 +494,7 @@ def _fig_leaderboard_flw_counts(df: pd.DataFrame, month_label: str = "") -> go.F
             tickfont=dict(size=14, color="black"),
             range=[0, range_max],
             tick0=0,
-            dtick=2,
+            dtick=_nice_dtick(range_max),
             showgrid=True, gridcolor="#f0f0f0", zeroline=False,
         ),
         yaxis=dict(
@@ -648,13 +724,24 @@ def _fig_leaderboard_retake_photo(df: pd.DataFrame) -> tuple[go.Figure, str]:
 
 
 def _site_flw_activity_stats(df: pd.DataFrame) -> tuple[pd.DataFrame, str, float]:
-    """Per-(site_full_id, flw_username) case count over the last 6
-    calendar months (all phases combined) — how many cases each FLW
-    recruited/screened at each site. Also returns the window label and
-    the number of weeks actually spanned by that window (based on the
-    earliest and latest case-registration dates present, not a fixed
-    26-week assumption), used to turn the raw cases/FLW ratio into a
+    """Per-(site_full_id, flw_username) case count, computed directly
+    from whatever `df` already contains — i.e. respects the sidebar's
+    global date filter (All data / Current month / Last 3 months /
+    Last 6 months / custom range) as-is, with no additional lookback
+    window applied here. So this updates automatically whenever the
+    global filter changes: how many cases each FLW recruited/screened
+    at each site, over whatever period is currently selected.
+
+    Also returns a label for the actual date range present in `df`,
+    and the number of weeks that range spans (based on the earliest
+    and latest case-registration dates actually present, not a fixed
+    assumption), used to turn the raw cases/FLW ratio into a
     cases/FLW/week rate.
+
+    The returned DataFrame also carries each FLW's own earliest and
+    latest `date_of_case_registered` within the currently filtered
+    data (`first_date` / `last_date`), for display in hover text —
+    this is per-FLW, not the overall window bounds.
 
     Note: this only covers FLWs with at least one case in the window.
     An FLW who recruited zero cases in the period leaves no rows in the
@@ -662,13 +749,18 @@ def _site_flw_activity_stats(df: pd.DataFrame) -> tuple[pd.DataFrame, str, float
     was never assigned to that site — there's no FLW roster in this data
     to compare against. The lowest-count active FLWs (sorted first in
     the hover list) are the closest available signal for underperformance."""
-    empty = pd.DataFrame(columns=["site_full_id", "flw_username", "total"])
-    recent, window_lbl = _last_n_months_df(df, n_months=6)
-    if recent.empty:
-        return empty, window_lbl, 1.0
-    dates = recent["date_of_case_registered"].dropna()
-    weeks = max((dates.max() - dates.min()).days / 7, 1.0) if not dates.empty else 1.0
-    d, flw = _valid_flw(recent)
+    empty = pd.DataFrame(columns=["site_full_id", "flw_username", "total", "first_date", "last_date"])
+    if df.empty or "date_of_case_registered" not in df.columns:
+        return empty, "", 1.0
+    dates = df["date_of_case_registered"].dropna()
+    if dates.empty:
+        return empty, "", 1.0
+    min_dt, max_dt = dates.min(), dates.max()
+    start_lbl = min_dt.strftime("%b %Y")
+    end_lbl = max_dt.strftime("%b %Y")
+    window_lbl = end_lbl if start_lbl == end_lbl else f"{start_lbl} - {end_lbl}"
+    weeks = max((max_dt - min_dt).days / 7, 1.0)
+    d, flw = _valid_flw(df)
     if d.empty:
         return empty, window_lbl, weeks
 
@@ -676,10 +768,17 @@ def _site_flw_activity_stats(df: pd.DataFrame) -> tuple[pd.DataFrame, str, float
     site = _flw_site_series(d)
     site = site.where(site.ne(""), "Unknown site")
 
-    total = d.groupby([site, flw])[id_col].nunique()
-    out = total.rename("total").reset_index()
-    out.columns = ["site_full_id", "flw_username", "total"]
+    grouped = d.groupby([site, flw])
+    total = grouped[id_col].nunique()
+    first_date = grouped["date_of_case_registered"].min()
+    last_date = grouped["date_of_case_registered"].max()
+    out = total.rename("total").to_frame()
+    out["first_date"] = first_date
+    out["last_date"] = last_date
+    out = out.reset_index()
+    out.columns = ["site_full_id", "flw_username", "total", "first_date", "last_date"]
     return out, window_lbl, weeks
+
 
 
 _SITE_TILE_PALETTE = [
@@ -759,12 +858,34 @@ def _fig_single_site_flw_detail(site: str, sub: pd.DataFrame, weeks: float = 1.0
     underperforming FLWs first in the data) — Plotly's default
     category-axis ordering places the first row at the bottom of a
     horizontal bar chart, so this puts the lowest count at the top of
-    the chart and the highest count at the bottom."""
+    the chart and the highest count at the bottom.
+
+    Hover also shows each FLW's earliest and latest
+    `date_of_case_registered` within the currently filtered data
+    (their own recruitment start / last-recruitment dates), plus their
+    cases/week rate. That rate — like the site-level cases/FLW/week
+    rate in the title — is each FLW's total divided by the same
+    `weeks` value (derived from the sidebar's selected Date range, not
+    from the data itself), so a given FLW's cases/week always comes
+    out identical here and in the "Top 10 FLWs by cases/week"
+    leaderboard, which uses the same shared denominator."""
     plot_df = sub.sort_values("total", ascending=False)
     n_flw = len(plot_df)
     total_cases = int(plot_df["total"].sum())
     ratio = (total_cases / n_flw) if n_flw else 0.0
     ratio_per_week = ratio / weeks if weeks else ratio
+
+    def _fmt_date(v) -> str:
+        ts = pd.Timestamp(v)
+        return ts.strftime("%d %b %Y") if pd.notna(ts) else "—"
+
+    first_dates = plot_df["first_date"].apply(_fmt_date)
+    last_dates = plot_df["last_date"].apply(_fmt_date)
+    flw_rate_fmt = [
+        f"{(t / weeks):.2f}" if weeks else f"{t:.2f}"
+        for t in plot_df["total"]
+    ]
+    customdata = list(zip(first_dates, last_dates, flw_rate_fmt))
 
     fig = go.Figure(go.Bar(
         y=plot_df["flw_username"], x=plot_df["total"], orientation="h",
@@ -772,7 +893,13 @@ def _fig_single_site_flw_detail(site: str, sub: pd.DataFrame, weeks: float = 1.0
         text=plot_df["total"].apply(lambda v: f"{int(v):,}"),
         textposition="outside",
         textfont=dict(size=12, color="black"),
-        hovertemplate="<b>%{y}</b><br>Cases: <b>%{x:,}</b><extra></extra>",
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{y}</b><br>Cases: <b>%{x:,}</b>"
+            "<br>Recruitment start date: <b>%{customdata[0]}</b>"
+            "<br>Last Recruitment Date: <b>%{customdata[1]}</b>"
+            "<br>Cases/week: <b>%{customdata[2]}</b><extra></extra>"
+        ),
     ))
     max_val = float(plot_df["total"].max()) if n_flw else 0.0
     fig.update_layout(
@@ -982,28 +1109,48 @@ def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
     return fig
 
 
-def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
-    """Leaderboard tab: current-month FLW screening-volume leaderboard
-    next to the overall FLW AI-override leaderboard."""
+def _render_leaderboard(
+    df_all: pd.DataFrame,
+    df_p2: pd.DataFrame,
+    filter_start=None,
+    filter_end=None,
+) -> None:
+    """Leaderboard tab: FLW cases/week leaderboard (over whatever the
+    global filter currently selects) next to the overall FLW
+    AI-override leaderboard.
+
+    `filter_start`/`filter_end` are the sidebar's actual selected Date
+    range boundaries — used (via `_filter_window_label_and_weeks`) as
+    the single shared weeks-denominator for cases/week, so a given
+    FLW's rate matches between the "Top 10 FLWs by cases/week" chart
+    and the "FLWs by site" bar chart below. Falls back to the data's
+    own min/max dates if no explicit filter range was passed in."""
     col_l, col_r = st.columns(2, gap="large")
 
+    counts_window_lbl, counts_weeks = _filter_window_label_and_weeks(
+        filter_start, filter_end
+    )
+    if not counts_window_lbl:
+        counts_window_lbl, counts_weeks = _window_label_and_weeks(df_all)
+
     with col_l:
-        cur_df, month_lbl = _current_month_df(df_all)
-        title_suffix = f" — {month_lbl}" if month_lbl else ""
+        title_suffix = f" — {counts_window_lbl}" if counts_window_lbl else ""
         st.markdown(
             "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
             "min-height:40px;'>"
-            f"🏆 Top 10 FLWs by cases screened{title_suffix}</div>",
+            f"🏆 Top 10 FLWs by cases/week{title_suffix}</div>",
             unsafe_allow_html=True,
         )
-        fig_counts = _fig_leaderboard_flw_counts(cur_df, month_label=month_lbl)
+        fig_counts = _fig_leaderboard_flw_counts(
+            df_all, window_label=counts_window_lbl, weeks=counts_weeks
+        )
         if fig_counts.data:
             st.plotly_chart(
                 fig_counts, width="stretch", key="lb_flw_counts",
                 config={"displaylogo": False},
             )
         else:
-            st.info("No FLW-level data available for the current month.")
+            st.info("No FLW-level data available for the current filters.")
 
         st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
 
@@ -1045,8 +1192,12 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
 
         st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
 
-        site_stats, site_window_lbl, site_weeks = _site_flw_activity_stats(df_all)
-        site_suffix = f" — {site_window_lbl}" if site_window_lbl else ""
+        site_stats, _site_window_lbl, _site_weeks = _site_flw_activity_stats(df_all)
+        # Reuse the same filter-derived label/weeks as the cases/week
+        # leaderboard above (not this function's own data-derived
+        # values) so a given FLW's cases/week rate matches exactly
+        # between the two charts.
+        site_suffix = f" — {counts_window_lbl}" if counts_window_lbl else ""
         # Sum of each site's unique-FLW count (i.e. count an FLW once per
         # site they're active at), matching what the tiles below add up
         # to — not a single global nunique(), which would dedupe an FLW
@@ -1064,7 +1215,7 @@ def _render_leaderboard(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
             "<div style='margin-bottom:-10px;'></div>",
             unsafe_allow_html=True,
         )
-        fig_site_grid = _fig_site_flw_grid(site_stats, site_weeks)
+        fig_site_grid = _fig_site_flw_grid(site_stats, counts_weeks)
         if fig_site_grid.data:
             # Key includes the grid's shape (rows/cols/site set) rather than
             # a fixed string. This chart is a Heatmap whose grid dimensions,
@@ -1577,7 +1728,13 @@ def _render_site_table(df: pd.DataFrame) -> None:
 # Public entry point — called by app.py's main()
 # ════════════════════════════════════════════════════════════════════
 
-def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> None:
+def render(
+    df_all: pd.DataFrame,
+    df_p1: pd.DataFrame,
+    df_p2: pd.DataFrame,
+    filter_start=None,
+    filter_end=None,
+) -> None:
     """
     Render the Research Dashboard – "Descriptive" and "Leaderboard" tabs.
 
@@ -1591,6 +1748,11 @@ def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> No
     df_p2  : phase-2 (AI-Enabled Screening) data — feeds the Leaderboard's
              % AI-override chart, since AI results/overrides only exist
              in phase 2.
+    filter_start, filter_end : the sidebar's actual selected "Date
+             range" boundaries (date objects). Used as the shared
+             cases/week denominator on the Leaderboard tab so a given
+             FLW's rate matches between its two cases/week charts —
+             see `_render_leaderboard`.
     """
     # Password gate
     if not _check_password():
@@ -1668,7 +1830,7 @@ def render(df_all: pd.DataFrame, df_p1: pd.DataFrame, df_p2: pd.DataFrame) -> No
         if df_all.empty and df_p2.empty:
             st.info("No data available for the current filters.")
         else:
-            _render_leaderboard(df_all, df_p2)
+            _render_leaderboard(df_all, df_p2, filter_start, filter_end)
     else:
         if df_p2.empty:
             st.info("No AI-Enabled Screening (phase-2) data available for the current filters.")

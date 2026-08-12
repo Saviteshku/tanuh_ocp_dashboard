@@ -809,54 +809,6 @@ def _study_setting_col(df: pd.DataFrame) -> str | None:
     return None
 
 
-def _date_window_mask(
-    df: pd.DataFrame,
-    window: str,
-    custom_start: pd.Timestamp | None = None,
-    custom_end: pd.Timestamp | None = None,
-    anchor: pd.Timestamp | None = None,
-) -> pd.Series:
-    if "date_of_case_registered" not in df.columns:
-        return pd.Series(True, index=df.index)
-
-    dates = df["date_of_case_registered"]
-    mask  = dates.notna()
-    if not mask.any():
-        return pd.Series(False, index=df.index)
-
-    if anchor is None:
-        anchor = dates.max()
-    if pd.isna(anchor):
-        return pd.Series(True, index=df.index)
-
-    if window == "All data":
-        return pd.Series(True, index=df.index)
-
-    if window == "Last 6 months":
-        anchor = pd.Timestamp(anchor)
-        start = (anchor.to_period("M") - 5).start_time
-        end = anchor
-        return mask & (dates >= start) & (dates <= end)
-
-    if window == "Current month":
-        anchor = pd.Timestamp(anchor)
-        start = anchor.to_period("M").start_time
-        end = anchor
-        return mask & (dates >= start) & (dates <= end)
-
-    if window == "Last 3 months":
-        anchor = pd.Timestamp(anchor)
-        start = (anchor.to_period("M") - 2).start_time
-        end = anchor
-        return mask & (dates >= start) & (dates <= end)
-    if window == "Custom range":
-        if custom_start is None or custom_end is None:
-            return pd.Series(True, index=df.index)
-        return mask & (dates.dt.date >= custom_start.date()) & (dates.dt.date <= custom_end.date())
-
-    return pd.Series(True, index=df.index)
-
-
 # ════════════════════════════════════════════════════════════════════
 # 6.  MAIN
 # ════════════════════════════════════════════════════════════════════
@@ -1016,20 +968,20 @@ def main() -> None:
         st.rerun()
     _f = st.session_state.flt_flip
 
-    quick_window = st.sidebar.selectbox(
-        "🗓️ Quick date filter",
-        ["All data", "Current month", "Last 3 months", "Last 6 months"],
-        key=f"qw_{_f}",
-    )
-
     all_dates = (
         df_raw["date_of_case_registered"].dropna()
         if "date_of_case_registered" in df_raw.columns
         else pd.Series(dtype="datetime64[ns]")
     )
 
-    quick_mask = _date_window_mask(df_raw, quick_window)
-    date_mask  = pd.Series(True, index=df_raw.index)
+    date_mask = pd.Series(True, index=df_raw.index)
+    # The sidebar's actual selected Date range boundaries, passed down
+    # to the Research Dashboard (see research_dashboard.render) so its
+    # cases/week charts use exactly this calendar span as the
+    # denominator — e.g. "current month" = 1st of the month through
+    # today — rather than deriving weeks from whichever case dates
+    # happen to be present in the filtered data.
+    filter_start = filter_end = None
 
     if not all_dates.empty:
         min_dt = all_dates.min().date()
@@ -1043,12 +995,11 @@ def main() -> None:
             key=f"dr_{_f}",
         )
         if isinstance(dr, tuple) and len(dr) == 2:
+            filter_start, filter_end = dr[0], dr[1]
             date_mask = (
                 (df_raw["date_of_case_registered"].dt.date >= dr[0]) &
                 (df_raw["date_of_case_registered"].dt.date <= dr[1])
             ) if "date_of_case_registered" in df_raw.columns else date_mask
-
-    date_mask = date_mask & quick_mask
 
     # Gender filter
     gender_col = _gender_col(df_raw)
@@ -1137,7 +1088,7 @@ def main() -> None:
         if research_dashboard is None:
             _render_coming_soon("Research Dashboard")
         else:
-            research_dashboard.render(df_all, df_p1, df_p2)
+            research_dashboard.render(df_all, df_p1, df_p2, filter_start, filter_end)
         st.markdown("---")
         st.markdown(
             '<div style="text-align:center;padding:10px 0;font-size:12px;color:#c0c0c0;">'
