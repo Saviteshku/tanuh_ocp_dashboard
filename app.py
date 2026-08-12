@@ -655,7 +655,12 @@ class _DataStore:
         if not self._cache_path:
             return
         try:
-            tmp_path = self._cache_path.with_suffix(self._cache_path.suffix + ".tmp")
+            # Unique per writer (pid + thread id) so that if two writers
+            # ever do end up racing, they never fight over the same .tmp
+            # file — each does its own write + atomic replace independently.
+            tmp_path = self._cache_path.with_suffix(
+                f"{self._cache_path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
             payload = {"code_version": self._code_version, "df": df}
             pd.to_pickle(payload, tmp_path)
             tmp_path.replace(self._cache_path)
@@ -705,29 +710,36 @@ class _DataStore:
              source (only happens on the very first run ever).
         """
         with self._lock:
-            have_data = self._df is not None
-        if not have_data:
-            cached_df = self._read_from_cache()
-            if cached_df is not None:
-                with self._lock:
-                    if self._df is None:
-                        self._df = cached_df
-                        self._loaded_at = time.time()
-                        self._loaded_from_cache = True
-                # Kick off a real refresh from the source right away in the
-                # background, instead of waiting a full refresh cycle.
-                self._ensure_thread(initial_delay=0.0)
-                with self._lock:
-                    return self._df
+            # Do the entire cold-start load (cache read, or synchronous
+            # source read + cache write) while holding the lock, so that
+            # if several Streamlit sessions call get() concurrently before
+            # any data is loaded, only the first one actually touches
+            # disk — the rest just wait and then see self._df already
+            # populated. Without this, concurrent cold-start callers could
+            # each try to write the on-disk cache at the same time.
+            if self._df is None:
+                cached_df = self._read_from_cache()
+                if cached_df is not None:
+                    self._df = cached_df
+                    self._loaded_at = time.time()
+                    self._loaded_from_cache = True
+                else:
+                    df = self._read_from_disk(self._path)
+                    self._write_to_cache(df)
+                    self._df = df
+                    self._loaded_at = time.time()
+                    self._loaded_from_cache = False
+                loaded_from_cache = self._loaded_from_cache
             else:
-                df = self._read_from_disk(self._path)
-                self._write_to_cache(df)
-                with self._lock:
-                    if self._df is None:
-                        self._df = df
-                        self._loaded_at = time.time()
-                        self._loaded_from_cache = False
-        self._ensure_thread(initial_delay=self._refresh_seconds)
+                loaded_from_cache = None  # not a cold start; no action needed below
+
+        if loaded_from_cache is True:
+            # Kick off a real refresh from the source right away in the
+            # background, instead of waiting a full refresh cycle.
+            self._ensure_thread(initial_delay=0.0)
+        elif loaded_from_cache is False:
+            self._ensure_thread(initial_delay=self._refresh_seconds)
+
         with self._lock:
             return self._df
 
