@@ -1026,9 +1026,18 @@ def main() -> None:
                     s = _min
                 st.session_state[_widget_key] = (s, e)
 
+        # Seed the initial value ourselves, once, instead of passing
+        # value= to the widget below. Once a widget's key exists in
+        # session_state, Streamlit ignores value= anyway (and logs the
+        # "created with a default value but also had its value set via
+        # Session State API" warning) — so passing both is redundant at
+        # best and noisy at worst. Only set it the first time this key
+        # appears in a session (or right after Reset All Filters pops it).
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = (min_dt, picker_max)
+
         dr = st.sidebar.date_input(
             "📅 Date range",
-            value=(min_dt, picker_max),
             min_value=min_dt,
             max_value=picker_max,
             format="DD/MM/YYYY",
