@@ -965,6 +965,12 @@ def main() -> None:
         st.session_state.flt_flip = False
     if st.sidebar.button("🔄 Reset All Filters"):
         st.session_state.flt_flip = not st.session_state.flt_flip
+        # _f only toggles between two values, so a widget key can be
+        # reused across resets — explicitly clear it so the date picker
+        # goes back to its full default range instead of remembering
+        # whichever range was last picked under that key.
+        new_f = st.session_state.flt_flip
+        st.session_state.pop(f"dr_{new_f}", None)
         st.rerun()
     _f = st.session_state.flt_flip
 
@@ -986,21 +992,48 @@ def main() -> None:
     if not all_dates.empty:
         min_dt = all_dates.min().date()
         data_max_dt = all_dates.max().date()
-        # Let users pick an end date up to today, even if no cases have
-        # been registered yet for the most recent day(s) — avoids the
-        # "outside allowed range" error when someone tries to pick, e.g.,
-        # today's date.
-        max_dt = max(data_max_dt, date.today())
-        # Default the selected end date to one week back from the latest
-        # available data, since the most recent week is often incomplete.
-        default_end_dt = max(data_max_dt - timedelta(days=7), min_dt)
+        today_dt = date.today()
+
+        # Keep max_value pinned at max(data_max_dt, today) permanently.
+        # Streamlit's built-in quick-select shortcuts (past 1 week, past 1
+        # month, 3 months, 6 months, etc.) all anchor their *end* date to
+        # the real today() — not to the data. If max_value ever dips below
+        # today, Streamlit's own widget validation rejects those shortcuts
+        # outright (before any of our code runs), which is what caused the
+        # "outside allowed range" error on every preset except the very
+        # first click.
+        picker_max = max(data_max_dt, today_dt)
+        widget_key = f"dr_{_f}"
+
+        def _clamp_date_range(_widget_key=widget_key, _data_max=data_max_dt, _min=min_dt):
+            # Streamlit can't tell us whether a value came from a manual
+            # calendar click or from a quick-select shortcut — both arrive
+            # as the same (start, end) tuple. Either way, if the end date
+            # lands beyond the latest date we actually have data for, snap
+            # it back to that latest date so shortcuts like "past month"
+            # can't silently include empty days. The calendar itself stays
+            # un-greyed up through today (picker_max), so a manual click on
+            # today's date is still possible — it's just corrected right
+            # after.
+            cur = st.session_state.get(_widget_key)
+            if isinstance(cur, tuple) and len(cur) == 2:
+                s, e = cur
+                if e is not None and e > _data_max:
+                    e = _data_max
+                if s is not None and s > e:
+                    s = e
+                if s is not None and s < _min:
+                    s = _min
+                st.session_state[_widget_key] = (s, e)
+
         dr = st.sidebar.date_input(
             "📅 Date range",
-            value=(min_dt, default_end_dt),
+            value=(min_dt, picker_max),
             min_value=min_dt,
-            max_value=max_dt,
+            max_value=picker_max,
             format="DD/MM/YYYY",
-            key=f"dr_{_f}",
+            key=widget_key,
+            on_change=_clamp_date_range,
         )
         if isinstance(dr, tuple) and len(dr) == 2:
             filter_start, filter_end = dr[0], dr[1]
