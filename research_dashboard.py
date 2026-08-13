@@ -807,7 +807,7 @@ def _wrap_label(text: str, width: int = 15, max_lines: int = 4) -> str:
     return "<br>".join(lines)
 
 
-def _format_flw_hover_block(sub: pd.DataFrame, max_rows_per_col: int = 14, max_cols: int = 6) -> str:
+def _format_flw_hover_block(sub: pd.DataFrame, max_rows_per_col: int = 15, max_cols: int = 6) -> str:
     """One "name: **count**" line per FLW, sorted ascending (already
     sorted by the caller) — every FLW is listed, with no cap. The count
     is styled bold + blue so it stands out from the FLW name. Once a
