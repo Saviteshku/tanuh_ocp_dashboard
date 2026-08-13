@@ -32,7 +32,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 import pandas as pd
@@ -985,10 +985,16 @@ def main() -> None:
 
     if not all_dates.empty:
         min_dt = all_dates.min().date()
-        max_dt = all_dates.max().date()
+        data_max_dt = all_dates.max().date()
+        # Cap the picker at "today" (not just the latest case-registration
+        # date in the data) so users can select an end date that extends
+        # up to the present even if no cases have been registered yet for
+        # the most recent day(s) — avoids the "outside allowed range" error
+        # when someone tries to pick, e.g., today's date.
+        max_dt = max(data_max_dt, date.today())
         dr = st.sidebar.date_input(
             "📅 Date range",
-            value=(min_dt, max_dt),
+            value=(min_dt, data_max_dt),
             min_value=min_dt,
             max_value=max_dt,
             format="DD/MM/YYYY",
