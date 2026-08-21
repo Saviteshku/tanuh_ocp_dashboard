@@ -1094,6 +1094,20 @@ def main() -> None:
         st.cache_data.clear()
         st.rerun()
 
+    # ── Latest data retrieval date (bottom of sidebar) ─────────────────
+    # "retrieval_date_time" is stamped per-source-file by merge_data.py
+    # (e.g. "2026-08-21T14:24:35" before the parquet write turns it into
+    # a real datetime64 column) — show only the most recent one, date
+    # only (no time-of-day), across every row currently loaded.
+    if "retrieval_date_time" in df_raw.columns:
+        _retrieval_dt = pd.to_datetime(df_raw["retrieval_date_time"], errors="coerce")
+        _latest_retrieval = _retrieval_dt.max()
+        if pd.notna(_latest_retrieval):
+            st.sidebar.markdown("---")
+            st.sidebar.caption(
+                f"📡 Data last retrieved: **{_latest_retrieval.strftime('%d/%m/%Y')}**"
+            )
+
     # ════════════════════════════════════════════════════════════════
     # Apply filters — produce three filtered views
     #   df_all : all phases combined (Overall tab)

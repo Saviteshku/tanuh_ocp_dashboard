@@ -1358,25 +1358,29 @@ def _ai_inference_confusion(df_p2: pd.DataFrame) -> dict:
 
 
 def _fig_confusion_matrix(conf: dict, n_total: int) -> go.Figure:
-    """3x3 confusion-matrix grid: AI Result (rows) vs TSD Diagnosis /
-    Suspicion (columns), with an extra "Total" row and column. Every
-    cell — core and total alike — is drawn as its own rect shape using
-    one shared inset formula, so all 9 boxes render at exactly the same
-    size. Core cells are filled with a smooth blue gradient scaled by
-    count (darker = higher count), with text color independently
-    switched to light-on-dark or dark-on-light based on that cell's own
-    shade. Total cells are transparent (no fill) with a thin outline and
-    plain dark text."""
+    """3x3 confusion-matrix grid: AI Result (columns, top) vs TSD
+    Diagnosis / Suspicion (rows, left), with an extra "Total" row and
+    column. Non-suspicious sits first (top-left) on both axes and
+    Suspicious sits second (bottom-right) on both, ahead of the Total
+    row/column. Every cell — core and total alike — is drawn as its own
+    rect shape using one shared inset formula, so all 9 boxes render at
+    exactly the same size. Core cells are filled with a smooth blue
+    gradient scaled by count (darker = higher count), with text color
+    independently switched to light-on-dark or dark-on-light based on
+    that cell's own shade. Total cells are transparent (no fill) with a
+    thin outline and plain dark text."""
     tp, fp, fn, tn = conf["tp"], conf["fp"], conf["fn"], conf["tn"]
 
-    core = [[tp, fp], [fn, tn]]
+    # Rows (yi) = TSD: 0 = Non-suspicious, 1 = Suspicious
+    # Cols (xi) = AI:  0 = Non-suspicious, 1 = Suspicious
+    core = [[tn, fp], [fn, tp]]
     zmax = max(max(row) for row in core) or 1
     pct = [[(v / n_total * 100 if n_total else 0.0) for v in row] for row in core]
-    row_totals = [tp + fp, fn + tn]
-    col_totals = [tp + fn, fp + tn]
+    row_totals = [tn + fp, fn + tp]
+    col_totals = [tn + fn, fp + tp]
 
-    x_labels = ["TSD: Suspicious", "TSD: Non-suspicious", "Total"]
-    y_labels = ["AI: Suspicious", "AI: Non-suspicious", "Total"]
+    x_labels = ["AI: Non-suspicious", "AI: Suspicious", "Total"]
+    y_labels = ["TSD: Non-suspicious", "TSD: Suspicious", "Total"]
 
     pad = 0.05  # shared inset (in cell units) applied to every box, core and total alike
 
@@ -1524,6 +1528,22 @@ def _render_site_table(df: pd.DataFrame) -> None:
         .nunique()
     )
 
+    # Phase(s) present for each site — shown in a new "Phase" column
+    # before the site name. A site_full_id normally maps to a single
+    # phase (phase-varying sites like Goa already get split into
+    # separate site_full_id values upstream in merge_data.py), but if
+    # more than one phase value is ever seen for the same site_full_id,
+    # all of them are shown together (e.g. "Phase 1 & 2") rather than
+    # silently picking one.
+    if "phase" in df.columns:
+        def _phase_label(s: pd.Series) -> str:
+            vals = sorted({int(v) for v in s.dropna().unique()})
+            return " & ".join(str(v) for v in vals) if vals else "—"
+
+        phase_by_site = df.groupby(site_key)["phase"].agg(_phase_label)
+    else:
+        phase_by_site = pd.Series(dtype=object)
+
     if "study_site_id" in df.columns:
         site_type_by_site = df.groupby(site_key)["study_site_id"].agg(
             lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), "")
@@ -1614,16 +1634,27 @@ def _render_site_table(df: pd.DataFrame) -> None:
         recent_date_str = max_dt_site.strftime('%d-%b-%Y') if pd.notna(max_dt_site) else "—"
 
         retrieval_dt = retrieval_date_by_site.get(site)
-        retrieval_date_str = retrieval_dt.strftime('%d-%b-%Y') if pd.notna(retrieval_dt) else "—"
+        if pd.notna(retrieval_dt):
+            # Date and 24-hour-clock time (hour:minute only) on separate lines.
+            retrieval_date_str = (
+                f"{html.escape(retrieval_dt.strftime('%d-%b-%Y'))}"
+                f"<br>{html.escape(retrieval_dt.strftime('%H:%M'))}"
+            )
+        else:
+            retrieval_date_str = "—"
+
+        phase_str = str(phase_by_site.get(site, "—"))
 
         rows_html.append(
             "<tr>"
+            f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
+            f"color:#000;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(phase_str)}</td>"
             f"<td style='padding:5px 10px;text-align:left;font-weight:600;"
             f"color:#333;border-top:1px solid #eee;'>{html.escape(site)}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
             f"color:{site_type_color};border-top:1px solid #eee;white-space:nowrap;'>{html.escape(site_type_str)}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
-            f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(retrieval_date_str)}</td>"
+            f"color:#555;border-top:1px solid #eee;white-space:nowrap;line-height:1.4;'>{retrieval_date_str}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
             f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(start_date_str)}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
@@ -1655,6 +1686,8 @@ def _render_site_table(df: pd.DataFrame) -> None:
 
     totals_row_html = (
         "<tr style='background:#fafafa;'>"
+        "<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        "color:#999;border-top:2px solid #ddd;'>–</td>"
         "<td style='padding:6px 10px;text-align:left;font-weight:800;"
         "color:#333;border-top:2px solid #ddd;'>Total</td>"
         "<td style='padding:6px 10px;text-align:center;font-weight:800;"
@@ -1681,6 +1714,9 @@ def _render_site_table(df: pd.DataFrame) -> None:
         "<table style='width:100%;border-collapse:collapse;background:#fff;"
         "border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,.07);'>"
         "<thead><tr style='background:#fafafa;'>"
+        "<th style='padding:10px 14px;text-align:center;font-size:14px;"
+        "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
+        "color:#555;'>Phase</th>"
         "<th style='padding:10px 14px;text-align:left;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
         "color:#555;'>Sites</th>"
@@ -1722,6 +1758,175 @@ def _render_site_table(df: pd.DataFrame) -> None:
             f"font-style:italic;line-height:1.5;'>{footnote_html}</div>",
             unsafe_allow_html=True,
         )
+
+
+# ════════════════════════════════════════════════════════════════════
+# Descriptive tab — two cross-tabs below the site table:
+# Provisional Diagnosis × Specialist Recommendation, phase-2 only,
+# split left/right by AI Result (Suspicious / Non-suspicious).
+# ════════════════════════════════════════════════════════════════════
+
+# Fixed display order for provisional_diagnosis rows in the cross-tabs
+# below (clinical severity order, not alphabetical). Any value found in
+# the data but not in this list is appended after these, still before
+# the Total row.
+_PROVISIONAL_DIAGNOSIS_ORDER = [
+    "Oral cavity normal",
+    "Benign",
+    "Other",
+    "Smokeless tobacco keratosis",
+    "Homogenous Oral leukoplakia",
+    "Oral submucosal fibrosis",
+    "Oral lichen planus",
+    "Speckled oral leukoplakia",
+    "Erythroplakia",
+    "Verrucous oral leukoplakia",
+    "Proliferative verrucous oral leukoplakia",
+    "Squamous cell carcinoma of oral mucous membrane",
+    "Non-diagnostic procedure finding",
+]
+
+
+def _crosstab_with_totals(df: pd.DataFrame, row_col: str, col_col: str, row_order=None):
+    """Two-way frequency table of row_col × col_col (rows with a blank
+    value in either column are dropped), with a Total row and Total
+    column appended. Returns None if either column is missing or no
+    rows survive the blank filter.
+
+    row_order : optional list giving the display order for the row
+    categories (matched case-insensitively). Categories present in the
+    data but not in row_order are appended afterward, in alphabetical
+    order, still ahead of the Total row.
+    """
+    if row_col not in df.columns or col_col not in df.columns:
+        return None
+    sub = df[[row_col, col_col]].copy()
+    mask = _present_mask(sub[row_col]) & _present_mask(sub[col_col])
+    sub = sub.loc[mask]
+    if sub.empty:
+        return None
+    sub[row_col] = sub[row_col].astype(str).str.strip()
+    sub[col_col] = sub[col_col].astype(str).str.strip()
+
+    ct = pd.crosstab(sub[row_col], sub[col_col])
+    ct = ct.reindex(sorted(ct.columns), axis=1)
+
+    if row_order:
+        lookup = {str(v).strip().lower(): v for v in ct.index}
+        ordered_idx = [lookup[v.strip().lower()] for v in row_order if v.strip().lower() in lookup]
+        leftover_idx = sorted(v for v in ct.index if v not in ordered_idx)
+        ct = ct.reindex(ordered_idx + leftover_idx, axis=0)
+    else:
+        ct = ct.reindex(sorted(ct.index), axis=0)
+
+    ct["Total"] = ct.sum(axis=1)
+    total_row = ct.sum(axis=0)
+    total_row.name = "Total"
+    ct = pd.concat([ct, total_row.to_frame().T])
+    return ct
+
+
+def _crosstab_html(ct: pd.DataFrame, heading: str, accent: str, n_total: int) -> str:
+    """Render a _crosstab_with_totals() table as a styled HTML table,
+    with the Total row/column bolded and tinted in the given accent
+    color."""
+    col_names = list(ct.columns)
+    row_names = list(ct.index)
+
+    header_cells = "".join(
+        "<th style='padding:8px 10px;text-align:center;font-size:12px;"
+        "font-weight:800;letter-spacing:.5px;text-transform:uppercase;"
+        f"color:{accent if c == 'Total' else '#555'};border-left:1px solid #eee;'>"
+        f"{html.escape(str(c))}</th>"
+        for c in col_names
+    )
+
+    body_rows = []
+    for r in row_names:
+        is_total_row = (r == "Total")
+        cells = "".join(
+            "<td style='padding:6px 10px;text-align:center;"
+            + (f"font-weight:800;color:{accent};" if (is_total_row or c == "Total") else "color:#333;")
+            + ("border-top:2px solid #ddd;" if is_total_row else "border-top:1px solid #f0f0f0;")
+            + "border-left:1px solid #f5f5f5;'>"
+            + f"{int(ct.loc[r, c]):,}</td>"
+            for c in col_names
+        )
+        row_label_style = (
+            f"font-weight:800;color:{accent};border-top:2px solid #ddd;"
+            if is_total_row else
+            "font-weight:600;color:#333;border-top:1px solid #f0f0f0;"
+        )
+        body_rows.append(
+            f"<tr><td style='padding:6px 10px;text-align:left;{row_label_style}'>"
+            f"{html.escape(str(r))}</td>{cells}</tr>"
+        )
+
+    return (
+        "<div style='overflow-x:auto;margin-bottom:18px;'>"
+        f"<div style='font-weight:800;font-size:14px;color:{accent};margin-bottom:6px;'>"
+        f"{html.escape(heading)} "
+        f"<span style='font-weight:600;color:#888;font-size:12px;'>(n = {n_total:,})</span></div>"
+        "<table style='width:100%;border-collapse:collapse;background:#fff;"
+        "border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);'>"
+        "<thead><tr style='background:#fafafa;'>"
+        "<th style='padding:8px 10px;text-align:left;font-size:12px;font-weight:800;"
+        "letter-spacing:.5px;text-transform:uppercase;color:#555;'>"
+        "Provisional Dx \\ Specialist Rec.</th>"
+        f"{header_cells}</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div>"
+    )
+
+
+def _render_ai_result_crosstabs(df_p2: pd.DataFrame) -> None:
+    """Descriptive-tab addendum: Provisional Diagnosis × Specialist
+    Recommendation cross-tabs, phase-2 data only, shown side by side —
+    Suspicious on the left, Non-suspicious on the right (per ai_result)."""
+    if df_p2.empty:
+        return
+    ai_col = _ai_result_col(df_p2)
+    if ai_col is None:
+        return
+    if "provisional_diagnosis" not in df_p2.columns or "specialist_recommendation" not in df_p2.columns:
+        return
+
+    susp_mask = _norm(df_p2[ai_col]).eq("suspicious")
+    non_mask = _norm(df_p2[ai_col]).eq("non suspicious")
+
+    st.markdown("<div style='margin-top:26px;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
+        "🧾 Provisional Diagnosis × Specialist Recommendation — by AI Result "
+        "(Phase 2)</div>",
+        unsafe_allow_html=True,
+    )
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        ct = _crosstab_with_totals(
+            df_p2.loc[susp_mask], "provisional_diagnosis", "specialist_recommendation",
+            row_order=_PROVISIONAL_DIAGNOSIS_ORDER,
+        )
+        if ct is None:
+            st.info("No Suspicious phase-2 cases with both fields completed.")
+        else:
+            st.markdown(
+                _crosstab_html(ct, "🔴 Suspicious", "#D94040", int(ct.loc["Total", "Total"])),
+                unsafe_allow_html=True,
+            )
+
+    with col_right:
+        ct = _crosstab_with_totals(
+            df_p2.loc[non_mask], "provisional_diagnosis", "specialist_recommendation",
+            row_order=_PROVISIONAL_DIAGNOSIS_ORDER,
+        )
+        if ct is None:
+            st.info("No Non-suspicious phase-2 cases with both fields completed.")
+        else:
+            st.markdown(
+                _crosstab_html(ct, "🟢 Non-Suspicious", "#228B22", int(ct.loc["Total", "Total"])),
+                unsafe_allow_html=True,
+            )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1826,6 +2031,7 @@ def render(
             st.info("No data available for the current filters.")
         else:
             _render_site_table(df_all)
+        _render_ai_result_crosstabs(df_p2)
     elif st.session_state.research_tab == 1:
         if df_all.empty and df_p2.empty:
             st.info("No data available for the current filters.")
