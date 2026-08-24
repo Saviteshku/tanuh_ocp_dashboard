@@ -1725,7 +1725,7 @@ def _render_site_table(df: pd.DataFrame) -> None:
         "color:#555;'>Site Type</th>"
         "<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
-        "color:#555;'>Retrieval Date</th>"
+        "color:#555;'>Retrival D&T</th>"
         "<th style='padding:10px 14px;text-align:center;font-size:14px;"
         "font-weight:800;letter-spacing:.8px;text-transform:uppercase;"
         "color:#555;'>Start Date</th>"
@@ -1892,7 +1892,10 @@ def _render_ai_result_crosstabs(df_p2: pd.DataFrame) -> None:
     susp_mask = _norm(df_p2[ai_col]).eq("suspicious")
     non_mask = _norm(df_p2[ai_col]).eq("non suspicious")
 
-    st.markdown("<div style='margin-top:26px;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<hr style='border:none;border-top:1.5px solid #ddd;margin:26px 0 18px;'>",
+        unsafe_allow_html=True,
+    )
     st.markdown(
         "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
         "🧾 Provisional Diagnosis × Specialist Recommendation — by AI Result "
