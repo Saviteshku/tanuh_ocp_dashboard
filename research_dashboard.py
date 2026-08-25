@@ -2042,6 +2042,17 @@ _SUSPICION_CANON: dict[str, str] = {
     "suspicious": "Suspicious (1)",
 }
 
+# Row-label variant used only for display in the Lesion/Patch x Suspicion
+# tables below, to distinguish TSD's suspicion call from the AI's
+# suspicion call (which appears elsewhere on the same tab/page). The
+# stats crosstab (_diag_accuracy) keeps using _SUSPICION_CANON as its
+# column labels, since _diag_accuracy's defaults key off "Suspicious (1)"
+# / "Non Suspicious (0)" exactly.
+_SUSPICION_CANON_TSD: dict[str, str] = {
+    "non suspicious": "TSD Non Suspicious (0)",
+    "suspicious": "TSD Suspicious (1)",
+}
+
 _LESION_CANON: dict[str, str] = {
     "no": "No (0)",
     "yes": "Yes (1)",
@@ -2085,7 +2096,7 @@ def _render_lesion_suspicion_crosstabs(df_all: pd.DataFrame, df_p2: pd.DataFrame
     with col_a:
         ct, pct = _row_pct_crosstab(
             df_all, "suspicion", "lesion_patch",
-            row_canon=_SUSPICION_CANON, col_canon=_LESION_CANON,
+            row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
         )
         if ct is None:
             st.info("No cases with both Lesion/Patch and Suspicion completed.")
@@ -2118,7 +2129,7 @@ def _render_lesion_suspicion_crosstabs(df_all: pd.DataFrame, df_p2: pd.DataFrame
     with col_b:
         ct, pct = _row_pct_crosstab(
             susp_sub, "suspicion", "lesion_patch",
-            row_canon=_SUSPICION_CANON, col_canon=_LESION_CANON,
+            row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
         )
         if ct is None:
             st.info("No Suspicious phase-2 cases with both fields completed.")
@@ -2134,7 +2145,7 @@ def _render_lesion_suspicion_crosstabs(df_all: pd.DataFrame, df_p2: pd.DataFrame
     with col_c:
         ct, pct = _row_pct_crosstab(
             non_sub, "suspicion", "lesion_patch",
-            row_canon=_SUSPICION_CANON, col_canon=_LESION_CANON,
+            row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
         )
         if ct is None:
             st.info("No Non-suspicious phase-2 cases with both fields completed.")
