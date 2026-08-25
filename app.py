@@ -809,6 +809,13 @@ def _study_setting_col(df: pd.DataFrame) -> str | None:
     return None
 
 
+def _states_col(df: pd.DataFrame) -> str | None:
+    for c in ("states", "state", "State", "States"):
+        if c in df.columns:
+            return c
+    return None
+
+
 # ════════════════════════════════════════════════════════════════════
 # 6.  MAIN
 # ════════════════════════════════════════════════════════════════════
@@ -1084,6 +1091,21 @@ def main() -> None:
     if live_sites:
         site_sel = st.sidebar.selectbox("🏥 Site", ["All"] + live_sites, key=f"st_{_f}")
 
+    # States filter
+    states_col = _states_col(df_raw)
+    states_values: list[str] = []
+    if states_col:
+        states_values = sorted(
+            v for v in df_raw[states_col].dropna().astype(str).unique().tolist()
+            if v.strip().lower() not in ("nan", "none", "", "-", ".")
+        )
+
+    states_sel = "All"
+    if states_values:
+        states_sel = st.sidebar.selectbox(
+            "🗺️ State", ["All"] + states_values, key=f"sx_{_f}"
+        )
+
     st.sidebar.markdown("---")
     if st.sidebar.button(
         "🔃 Reload Data",
@@ -1135,7 +1157,10 @@ def main() -> None:
             if setting_col in _df.columns:
                 _df.drop(_df.index[_df[setting_col].astype(str) != setting_sel], inplace=True)
 
-    # Snapshot for Overall map — date + gender only, no site filter
+    # Snapshot for Overall map — date/gender/setting only, no site or
+    # states filter (those two are geographic, and clipping the
+    # snapshot to one site/state would defeat the point of the
+    # choropleth showing the whole country)
     df_all_map = df_all.copy()
 
     # Site filter
@@ -1143,6 +1168,12 @@ def main() -> None:
         for _df in (df_all, df_p1, df_p2):
             if "site_full_id" in _df.columns:
                 _df.drop(_df.index[_df["site_full_id"].astype(str) != site_sel], inplace=True)
+
+    # States filter
+    if states_sel != "All" and states_col:
+        for _df in (df_all, df_p1, df_p2):
+            if states_col in _df.columns:
+                _df.drop(_df.index[_df[states_col].astype(str) != states_sel], inplace=True)
 
     # ════════════════════════════════════════════════════════════════
     # Research Dashboard — delegated entirely to research_dashboard.py

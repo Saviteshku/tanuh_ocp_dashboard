@@ -1357,96 +1357,77 @@ def _ai_inference_confusion(df_p2: pd.DataFrame) -> dict:
     return {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
-def _fig_confusion_matrix(conf: dict, n_total: int) -> go.Figure:
-    """3x3 confusion-matrix grid: AI Result (columns, top) vs TSD
-    Diagnosis / Suspicion (rows, left), with an extra "Total" row and
-    column. Non-suspicious sits first (top-left) on both axes and
-    Suspicious sits second (bottom-right) on both, ahead of the Total
-    row/column. Every cell — core and total alike — is drawn as its own
-    rect shape using one shared inset formula, so all 9 boxes render at
-    exactly the same size. Core cells are filled with a smooth blue
-    gradient scaled by count (darker = higher count), with text color
-    independently switched to light-on-dark or dark-on-light based on
-    that cell's own shade. Total cells are transparent (no fill) with a
-    thin outline and plain dark text."""
+def _confusion_matrix_html(conf: dict, n_total: int, accent: str = "#0771eb") -> str:
+    """Plain black-and-white HTML table rendering of the confusion
+    matrix — same table style as the Descriptive tab's cross-tabs
+    (_crosstab_html): no colour fill, just bordered cells, with the
+    Total row/column bolded and tinted in the accent colour. AI Result
+    (0/1) runs across the columns, TSD Suspicion (0/1) runs down the
+    rows — the same labels used elsewhere in the AI Inference tab, with
+    the 0/1 codes appended. Counts only, no percentages."""
     tp, fp, fn, tn = conf["tp"], conf["fp"], conf["fn"], conf["tn"]
 
-    # Rows (yi) = TSD: 0 = Non-suspicious, 1 = Suspicious
-    # Cols (xi) = AI:  0 = Non-suspicious, 1 = Suspicious
+    # Rows = TSD: 0 = Non-suspicious, 1 = Suspicious
+    # Cols = AI:  0 = Non-suspicious, 1 = Suspicious
     core = [[tn, fp], [fn, tp]]
-    zmax = max(max(row) for row in core) or 1
-    pct = [[(v / n_total * 100 if n_total else 0.0) for v in row] for row in core]
     row_totals = [tn + fp, fn + tp]
     col_totals = [tn + fn, fp + tp]
 
-    x_labels = ["AI: Non-suspicious", "AI: Suspicious", "Total"]
-    y_labels = ["TSD: Non-suspicious", "TSD: Suspicious", "Total"]
+    col_labels = ["AI: Non-suspicious (0)", "AI: Suspicious (1)", "Total"]
+    row_labels = ["TSD: Non-suspicious (0)", "TSD: Suspicious (1)", "Total"]
 
-    pad = 0.05  # shared inset (in cell units) applied to every box, core and total alike
-
-    def _box(xi: int, yi: int):
-        return xi - 0.5 + pad, xi + 0.5 - pad, yi - 0.5 + pad, yi + 0.5 - pad
-
-    shapes, annotations = [], []
-
-    # Core 2x2 cells — filled with a Blues shade sampled from each cell's
-    # own count fraction, so the box itself carries the gradient.
-    for yi in range(2):
-        for xi in range(2):
-            v = core[yi][xi]
-            frac = v / zmax
-            fill = pcolors.sample_colorscale("Blues", [frac])[0]
-            font_color = "#FFFFFF" if frac > 0.55 else "#111111"
-            x0, x1, y0, y1 = _box(xi, yi)
-            shapes.append(dict(
-                type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=y0, y1=y1,
-                line=dict(color="rgba(0,0,0,0)", width=0), fillcolor=fill,
-            ))
-            annotations.append(dict(
-                x=xi, y=yi, text=f"<b>{v:,}</b><br>{pct[yi][xi]:.1f}%",
-                showarrow=False, font=dict(size=22, color=font_color, family="Arial Black"),
-            ))
-
-    # Total row (x=2), total column (y=2), and grand total (x=2, y=2) —
-    # same box size as the core cells, transparent fill, thin outline.
-    def _total_box(xi: int, yi: int, text: str):
-        x0, x1, y0, y1 = _box(xi, yi)
-        shapes.append(dict(
-            type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=y0, y1=y1,
-            line=dict(color="#cccccc", width=1.5), fillcolor="rgba(0,0,0,0)",
-        ))
-        annotations.append(dict(
-            x=xi, y=yi, text=f"<b>{text}</b>", showarrow=False,
-            font=dict(size=20, color="#333333", family="Arial Black"),
-        ))
-
-    for yi in range(2):
-        _total_box(2, yi, f"{row_totals[yi]:,}")
-    for xi in range(2):
-        _total_box(xi, 2, f"{col_totals[xi]:,}")
-    _total_box(2, 2, f"{n_total:,}")
-
-    fig = go.Figure()
-    fig.update_layout(
-        height=520,
-        margin=dict(t=10, b=10, l=10, r=10),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        xaxis=dict(
-            range=[-0.5, 2.5], tickmode="array", tickvals=[0, 1, 2], ticktext=x_labels,
-            side="top", tickfont=dict(size=14, color="#333", family="Arial Black"),
-            showgrid=False, zeroline=False, constrain="domain",
-        ),
-        yaxis=dict(
-            range=[2.5, -0.5], tickmode="array", tickvals=[0, 1, 2], ticktext=y_labels,
-            tickfont=dict(size=14, color="#333", family="Arial Black"),
-            showgrid=False, zeroline=False,
-            scaleanchor="x", scaleratio=1, constrain="domain",
-        ),
-        annotations=annotations,
-        shapes=shapes,
+    header_cells = "".join(
+        "<th style='padding:8px 10px;text-align:center;font-size:12px;"
+        "font-weight:800;letter-spacing:.5px;text-transform:uppercase;"
+        f"color:{accent if c == 'Total' else '#555'};border-left:1px solid #eee;'>"
+        f"{html.escape(c)}</th>"
+        for c in col_labels
     )
-    return fig
+
+    body_rows = []
+    for yi in range(2):
+        cells = "".join(
+            "<td style='padding:6px 10px;text-align:center;"
+            "font-weight:700;color:#333;border-top:1px solid #f0f0f0;"
+            "border-left:1px solid #f5f5f5;'>"
+            f"{core[yi][xi]:,}</td>"
+            for xi in range(2)
+        )
+        total_cell = (
+            f"<td style='padding:6px 10px;text-align:center;font-weight:800;"
+            f"color:{accent};border-top:1px solid #f0f0f0;"
+            f"border-left:1px solid #f5f5f5;'>{row_totals[yi]:,}</td>"
+        )
+        body_rows.append(
+            "<tr><td style='padding:6px 10px;text-align:left;font-weight:600;"
+            "color:#333;border-top:1px solid #f0f0f0;'>"
+            f"{html.escape(row_labels[yi])}</td>{cells}{total_cell}</tr>"
+        )
+
+    total_cells = "".join(
+        f"<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        f"color:{accent};border-top:2px solid #ddd;"
+        f"border-left:1px solid #f5f5f5;'>{col_totals[xi]:,}</td>"
+        for xi in range(2)
+    )
+    body_rows.append(
+        f"<tr><td style='padding:6px 10px;text-align:left;font-weight:800;"
+        f"color:{accent};border-top:2px solid #ddd;'>Total</td>{total_cells}"
+        f"<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        f"color:{accent};border-top:2px solid #ddd;"
+        f"border-left:1px solid #f5f5f5;'>{n_total:,}</td></tr>"
+    )
+
+    return (
+        "<div style='overflow-x:auto;margin-bottom:6px;'>"
+        "<table style='border-collapse:collapse;background:#fff;"
+        "border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);'>"
+        "<thead><tr style='background:#fafafa;'>"
+        "<th style='padding:8px 10px;text-align:left;font-size:12px;font-weight:800;"
+        "letter-spacing:.5px;text-transform:uppercase;color:#555;'>"
+        "TSD \\ AI Result</th>"
+        f"{header_cells}</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div>"
+    )
 
 
 def _render_ai_inference(df_p2: pd.DataFrame) -> None:
@@ -1466,16 +1447,17 @@ def _render_ai_inference(df_p2: pd.DataFrame) -> None:
         "🧩 Confusion Matrix — AI vs TSD</div>",
         unsafe_allow_html=True,
     )
-    fig_conf = _fig_confusion_matrix(conf, n_total)
-    st.plotly_chart(
-        fig_conf, width="stretch", key="ai_inference_confusion",
-        config={"displaylogo": False},
-    )
-    st.markdown(
-        f"<div style='text-align:center;margin-top:-6px;font-size:13px;color:#888;'>"
-        f"n = {n_total:,} phase-2 cases with a completed TSD review</div>",
-        unsafe_allow_html=True,
-    )
+    col_left, col_right = st.columns([1, 1])
+    with col_left:
+        st.markdown(
+            _confusion_matrix_html(conf, n_total),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div style='font-size:13px;color:#888;margin-top:-2px;'>"
+            f"n = {n_total:,} phase-2 cases with a completed TSD review</div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1877,6 +1859,295 @@ def _crosstab_html(ct: pd.DataFrame, heading: str, accent: str, n_total: int) ->
     )
 
 
+def _row_pct_crosstab(
+    df: pd.DataFrame, row_col: str, col_col: str, row_order=None, col_order=None,
+    row_canon=None, col_canon=None,
+):
+    """Two-way frequency + row-percentage table of row_col × col_col —
+    mirrors Stata's `tab row_col col_col, row`. Rows with a blank value
+    in either column are dropped. Returns (counts_df, row_pct_df), each
+    with an appended Total row/column (row percentages are computed so
+    every row, including the Total row, sums to 100). Returns (None,
+    None) if either column is missing or no rows survive the blank
+    filter.
+
+    row_order / col_order : optional lists giving display order for the
+    row/column categories (matched case-insensitively). Categories
+    present in the data but not listed are appended afterward,
+    alphabetically, still ahead of the Total row/column.
+
+    row_canon / col_canon : optional {lowercased_value: canonical_label}
+    dicts used to collapse casing variants (e.g. "Non suspicious" and
+    "Non Suspicious") into a single category before crosstabbing.
+    """
+    if row_col not in df.columns or col_col not in df.columns:
+        return None, None
+    sub = df[[row_col, col_col]].copy()
+    mask = _present_mask(sub[row_col]) & _present_mask(sub[col_col])
+    sub = sub.loc[mask]
+    if sub.empty:
+        return None, None
+    sub[row_col] = sub[row_col].astype(str).str.strip()
+    sub[col_col] = sub[col_col].astype(str).str.strip()
+    if row_canon:
+        sub[row_col] = sub[row_col].apply(lambda v: row_canon.get(v.lower(), v))
+    if col_canon:
+        sub[col_col] = sub[col_col].apply(lambda v: col_canon.get(v.lower(), v))
+
+    ct = pd.crosstab(sub[row_col], sub[col_col])
+
+    def _ordered(labels, order):
+        if order:
+            lookup = {str(v).strip().lower(): v for v in labels}
+            picked = [lookup[v.strip().lower()] for v in order if v.strip().lower() in lookup]
+            leftover = sorted(v for v in labels if v not in picked)
+            return picked + leftover
+        return sorted(labels)
+
+    ct = ct.reindex(_ordered(ct.index, row_order), axis=0)
+    ct = ct.reindex(_ordered(ct.columns, col_order), axis=1)
+
+    ct["Total"] = ct.sum(axis=1)
+    total_row = ct.sum(axis=0)
+    total_row.name = "Total"
+    ct = pd.concat([ct, total_row.to_frame().T])
+
+    pct = ct.div(ct["Total"], axis=0) * 100
+    return ct, pct
+
+
+def _row_pct_crosstab_html(
+    ct: pd.DataFrame, pct: pd.DataFrame, row_label: str, col_label: str,
+    heading: str, accent: str, n_total: int,
+) -> str:
+    """Render a _row_pct_crosstab() pair as a styled HTML table, each
+    cell showing frequency on top and row-percentage below it (Stata
+    `, row` style), with the Total row/column bolded and tinted."""
+    col_names = list(ct.columns)
+    row_names = list(ct.index)
+
+    header_cells = "".join(
+        "<th style='padding:8px 10px;text-align:center;font-size:12px;"
+        "font-weight:800;letter-spacing:.5px;text-transform:uppercase;"
+        f"color:{accent if c == 'Total' else '#555'};border-left:1px solid #eee;'>"
+        f"{html.escape(str(c))}</th>"
+        for c in col_names
+    )
+
+    body_rows = []
+    for r in row_names:
+        is_total_row = (r == "Total")
+        cells = []
+        for c in col_names:
+            emph = is_total_row or (c == "Total")
+            freq = int(ct.loc[r, c])
+            pctval = float(pct.loc[r, c])
+            cells.append(
+                "<td style='padding:6px 10px;text-align:center;"
+                + ("border-top:2px solid #ddd;" if is_total_row else "border-top:1px solid #f0f0f0;")
+                + "border-left:1px solid #f5f5f5;'>"
+                + f"<div style='font-weight:{'800' if emph else '700'};"
+                + f"color:{accent if emph else '#333'};'>{freq:,}</div>"
+                + f"<div style='font-size:11px;font-weight:500;color:#999;'>{pctval:.2f}%</div>"
+                + "</td>"
+            )
+        row_label_style = (
+            f"font-weight:800;color:{accent};border-top:2px solid #ddd;"
+            if is_total_row else
+            "font-weight:600;color:#333;border-top:1px solid #f0f0f0;"
+        )
+        body_rows.append(
+            f"<tr><td style='padding:6px 10px;text-align:left;{row_label_style}'>"
+            f"{html.escape(str(r))}</td>{''.join(cells)}</tr>"
+        )
+
+    return (
+        "<div style='overflow-x:auto;margin-bottom:18px;'>"
+        f"<div style='font-weight:800;font-size:14px;color:{accent};margin-bottom:6px;'>"
+        f"{html.escape(heading)} "
+        f"<span style='font-weight:600;color:#888;font-size:12px;'>(n = {n_total:,})</span></div>"
+        "<table style='width:100%;border-collapse:collapse;background:#fff;"
+        "border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);'>"
+        "<thead><tr style='background:#fafafa;'>"
+        "<th style='padding:8px 10px;text-align:left;font-size:12px;font-weight:800;"
+        "letter-spacing:.5px;text-transform:uppercase;color:#555;'>"
+        f"{html.escape(row_label)} \\ {html.escape(col_label)}</th>"
+        f"{header_cells}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+        "<div style='font-size:10.5px;color:#aaa;margin-top:4px;'>"
+        "Each cell: frequency, row %</div>"
+        "</div>"
+    )
+
+
+def _diag_accuracy(
+    ct: pd.DataFrame, pos_row: str = "Yes (1)", neg_row: str = "No (0)",
+    pos_col: str = "Suspicious (1)", neg_col: str = "Non Suspicious (0)",
+) -> dict | None:
+    """Sensitivity / Specificity / PPV / NPV / LR+ / LR- from a
+    _row_pct_crosstab() counts table, treating pos_row as index-test-
+    positive (lesion/patch present) and pos_col as reference-standard-
+    positive (Suspicious). Returns None if any of the four cells are
+    missing (e.g. that category didn't occur in this subset)."""
+    try:
+        tp = float(ct.loc[pos_row, pos_col])
+        fp = float(ct.loc[pos_row, neg_col])
+        fn = float(ct.loc[neg_row, pos_col])
+        tn = float(ct.loc[neg_row, neg_col])
+    except KeyError:
+        return None
+    sens = tp / (tp + fn) if (tp + fn) else float("nan")
+    spec = tn / (tn + fp) if (tn + fp) else float("nan")
+    ppv  = tp / (tp + fp) if (tp + fp) else float("nan")
+    npv  = tn / (tn + fn) if (tn + fn) else float("nan")
+    lr_pos = (sens / (1 - spec)) if spec < 1 else float("inf")
+    lr_neg = ((1 - sens) / spec) if spec > 0 else float("inf")
+    return {
+        "Sensitivity": sens * 100, "Specificity": spec * 100,
+        "PPV": ppv * 100, "NPV": npv * 100,
+        "LR+": lr_pos, "LR-": lr_neg,
+    }
+
+
+def _diag_accuracy_html(stats: dict, accent: str) -> str:
+    """Compact stat-strip rendering of _diag_accuracy()'s output,
+    meant to sit directly beneath a _row_pct_crosstab_html() table."""
+    def _fmt(v: float) -> str:
+        return "∞" if v == float("inf") else f"{v:.2f}"
+
+    items = [
+        ("Sensitivity", f"{stats['Sensitivity']:.1f}%"),
+        ("Specificity", f"{stats['Specificity']:.1f}%"),
+        ("PPV", f"{stats['PPV']:.1f}%"),
+        ("NPV", f"{stats['NPV']:.1f}%"),
+        ("LR+", _fmt(stats["LR+"])),
+        ("LR-", _fmt(stats["LR-"])),
+    ]
+    cells = "".join(
+        "<div style='text-align:center;flex:1;'>"
+        "<div style='font-size:10px;font-weight:700;letter-spacing:.4px;"
+        f"text-transform:uppercase;color:#999;'>{label}</div>"
+        f"<div style='font-size:14px;font-weight:800;color:{accent};'>{val}</div>"
+        "</div>"
+        for label, val in items
+    )
+    return (
+        "<div style='display:flex;gap:4px;padding:10px 4px 2px;"
+        "border-top:1px dashed #ddd;margin-top:4px;'>"
+        f"{cells}</div>"
+    )
+
+
+_SUSPICION_CANON: dict[str, str] = {
+    "non suspicious": "Non Suspicious (0)",
+    "suspicious": "Suspicious (1)",
+}
+
+_LESION_CANON: dict[str, str] = {
+    "no": "No (0)",
+    "yes": "Yes (1)",
+}
+
+
+def _render_lesion_suspicion_crosstabs(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
+    """Descriptive-tab addendum: Suspicion × Lesion/Patch cross-tab with
+    row percentages (Stata `tab suspicion lesion_patch, row`) — overall
+    on the combined dataset, then split by AI Result (Suspicious /
+    Non-suspicious), phase-2 only. Three tables shown side by side.
+
+    Sensitivity/Specificity/PPV/NPV/LR+/LR- are shown only under the
+    Overall table. They're deliberately omitted from the two AI-split
+    tables: those subsets are conditioned on the AI's own suspicion
+    call, which is correlated with both lesion_patch and suspicion, so
+    accuracy figures computed inside them would reflect spectrum/
+    collider-stratification bias rather than lesion_patch's true
+    diagnostic accuracy."""
+    if "lesion_patch" not in df_all.columns or "suspicion" not in df_all.columns:
+        st.warning(
+            "Lesion/Patch × Suspicion table skipped — the Overall data doesn't "
+            f"currently have both \"lesion_patch\" and \"suspicion\" columns.\n\n"
+            f"\"lesion_patch\" present: {'lesion_patch' in df_all.columns}\n\n"
+            f"\"suspicion\" present: {'suspicion' in df_all.columns}"
+        )
+        return
+
+    st.markdown(
+        "<hr style='border:none;border-top:1.5px solid #ddd;margin:26px 0 18px;'>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
+        "🩺 Lesion/Patch × Suspicion — Overall vs. by AI Result</div>",
+        unsafe_allow_html=True,
+    )
+
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        ct, pct = _row_pct_crosstab(
+            df_all, "suspicion", "lesion_patch",
+            row_canon=_SUSPICION_CANON, col_canon=_LESION_CANON,
+        )
+        if ct is None:
+            st.info("No cases with both Lesion/Patch and Suspicion completed.")
+        else:
+            st.markdown(
+                _row_pct_crosstab_html(
+                    ct, pct, "Suspicion", "Lesion/Patch",
+                    "📋 Overall", "#0771eb", int(ct.loc["Total", "Total"]),
+                ),
+                unsafe_allow_html=True,
+            )
+            # Sensitivity/specificity etc. are defined relative to
+            # Lesion/Patch as the index test and Suspicion as the
+            # reference standard — that mapping is independent of how
+            # the table above is displayed, so compute it off a
+            # lesion-as-row/suspicion-as-column crosstab, not off the
+            # display-oriented `ct` above.
+            ct_stats, _ = _row_pct_crosstab(
+                df_all, "lesion_patch", "suspicion",
+                row_canon=_LESION_CANON, col_canon=_SUSPICION_CANON,
+            )
+            stats = _diag_accuracy(ct_stats) if ct_stats is not None else None
+            if stats:
+                st.markdown(_diag_accuracy_html(stats, "#0771eb"), unsafe_allow_html=True)
+
+    ai_col = _ai_result_col(df_p2) if not df_p2.empty else None
+    susp_sub = df_p2.loc[_norm(df_p2[ai_col]).eq("suspicious")] if ai_col else df_p2.iloc[0:0]
+    non_sub = df_p2.loc[_norm(df_p2[ai_col]).eq("non suspicious")] if ai_col else df_p2.iloc[0:0]
+
+    with col_b:
+        ct, pct = _row_pct_crosstab(
+            susp_sub, "suspicion", "lesion_patch",
+            row_canon=_SUSPICION_CANON, col_canon=_LESION_CANON,
+        )
+        if ct is None:
+            st.info("No Suspicious phase-2 cases with both fields completed.")
+        else:
+            st.markdown(
+                _row_pct_crosstab_html(
+                    ct, pct, "Suspicion", "Lesion/Patch",
+                    "🟠 AI: Suspicious", "#F4A900", int(ct.loc["Total", "Total"]),
+                ),
+                unsafe_allow_html=True,
+            )
+
+    with col_c:
+        ct, pct = _row_pct_crosstab(
+            non_sub, "suspicion", "lesion_patch",
+            row_canon=_SUSPICION_CANON, col_canon=_LESION_CANON,
+        )
+        if ct is None:
+            st.info("No Non-suspicious phase-2 cases with both fields completed.")
+        else:
+            st.markdown(
+                _row_pct_crosstab_html(
+                    ct, pct, "Suspicion", "Lesion/Patch",
+                    "🟢 AI: Non-Suspicious", "#228B22", int(ct.loc["Total", "Total"]),
+                ),
+                unsafe_allow_html=True,
+            )
+
+
 def _render_ai_result_crosstabs(df_p2: pd.DataFrame) -> None:
     """Descriptive-tab addendum: Provisional Diagnosis × Specialist
     Recommendation cross-tabs, phase-2 data only, shown side by side —
@@ -1914,7 +2185,7 @@ def _render_ai_result_crosstabs(df_p2: pd.DataFrame) -> None:
             st.info("No Suspicious phase-2 cases with both fields completed.")
         else:
             st.markdown(
-                _crosstab_html(ct, "🔴 Suspicious", "#D94040", int(ct.loc["Total", "Total"])),
+                _crosstab_html(ct, "🟠 AI: Suspicious", "#F4A900", int(ct.loc["Total", "Total"])),
                 unsafe_allow_html=True,
             )
 
@@ -1927,7 +2198,7 @@ def _render_ai_result_crosstabs(df_p2: pd.DataFrame) -> None:
             st.info("No Non-suspicious phase-2 cases with both fields completed.")
         else:
             st.markdown(
-                _crosstab_html(ct, "🟢 Non-Suspicious", "#228B22", int(ct.loc["Total", "Total"])),
+                _crosstab_html(ct, "🟢 AI: Non-Suspicious", "#228B22", int(ct.loc["Total", "Total"])),
                 unsafe_allow_html=True,
             )
 
@@ -2034,6 +2305,7 @@ def render(
             st.info("No data available for the current filters.")
         else:
             _render_site_table(df_all)
+        _render_lesion_suspicion_crosstabs(df_all, df_p2)
         _render_ai_result_crosstabs(df_p2)
     elif st.session_state.research_tab == 1:
         if df_all.empty and df_p2.empty:
