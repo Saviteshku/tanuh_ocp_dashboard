@@ -1,0 +1,53 @@
+name: build-and-push
+
+# Tags every main build as :<short-sha> — the immutable tag the aa-infra
+# overlays pin — plus :main as a convenience pointer to the newest build.
+# Deployments always pin the sha; nothing tracks :main automatically.
+#
+# The registry namespace comes from the DOCKERHUB_NAMESPACE repository
+# variable, falling back to the iisc org. Set it to a personal account to get
+# CI publishing without org credentials:
+#
+#   gh variable set DOCKERHUB_NAMESPACE --repo <owner>/<repo> --body govindartpark
+#
+# and switch back later by deleting that variable — no workflow edit needed.
+#
+# Requires two repository SECRETS, DOCKERHUB_USERNAME and DOCKERHUB_TOKEN,
+# where the token is a Docker Hub access token with Read & Write scope (an
+# account password will not work if 2FA is enabled).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'iisc' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # linux/amd64 only — the GKE node pools are amd64, and cross-building
+          # for arm64 costs build time for an architecture nothing here runs on.
+          platforms: linux/amd64
+          tags: |
+            ${{ env.NAMESPACE }}/tanuh-ocp-dashboard:main
+            ${{ env.NAMESPACE }}/tanuh-ocp-dashboard:${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
