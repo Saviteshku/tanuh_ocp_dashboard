@@ -1324,16 +1324,31 @@ def _render_leaderboard(
 # AI Inference — phase-2 confusion matrix (AI Result vs TSD Suspicion)
 # ════════════════════════════════════════════════════════════════════
 
+def _phase2_reviewed_mask(g: pd.DataFrame) -> pd.Series:
+    """Rows with a completed TSD review — `provisional_diagnosis` present.
+    This is the sole condition (matching the "Total TSD" count used
+    elsewhere, e.g. the phase-2 sankey): `suspicion` is NOT additionally
+    required to be non-blank here, because — like the `risk` field in the
+    phase-1 "reviewed" definition — `suspicion` is typically left blank
+    for a genuine TSD "Non-suspicious" read rather than filled in
+    explicitly. Requiring it to be present would silently drop true
+    negatives instead of just non-reviewed rows."""
+    return (
+        _present_mask(g["provisional_diagnosis"])
+        if "provisional_diagnosis" in g.columns
+        else pd.Series(False, index=g.index)
+    )
+
+
 def _ai_inference_confusion(df_p2: pd.DataFrame) -> dict:
     """Confusion-matrix counts for phase-2 AI Inference: AI Result
     (prediction) vs the TSD's Suspicion field (ground truth) — "Suspicious"
     is the positive class on both sides. Restricted to rows with a valid
     AI Result ("Suspicious" / "Non suspicious") AND a completed TSD review
-    (provisional_diagnosis present) — this matches the "Total TSD" count
-    used by the phase-2 sankey in the Monitoring Dashboard. (Not the
-    stricter phase-1 "reviewed" definition, which also requires `risk` —
-    that field is typically blank for non-suspicious TSD reads and would
-    undercount true negatives.)"""
+    (see `_phase2_reviewed_mask`) — this matches the "Total TSD" count used
+    by the phase-2 sankey in the Monitoring Dashboard. A blank `suspicion`
+    on a reviewed row is treated as ground-truth "Non-suspicious" (see
+    `_phase2_reviewed_mask` for why)."""
     empty = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
     if df_p2.empty:
         return empty
@@ -1343,7 +1358,7 @@ def _ai_inference_confusion(df_p2: pd.DataFrame) -> dict:
 
     ai_s_m  = _present_mask(df_p2[ai_col]) & _norm(df_p2[ai_col]).eq("suspicious")
     ai_ns_m = _present_mask(df_p2[ai_col]) & _norm(df_p2[ai_col]).eq("non suspicious")
-    tsd_reviewed = _present_mask(df_p2["provisional_diagnosis"])
+    tsd_reviewed = _phase2_reviewed_mask(df_p2)
     ground_truth_susp = (
         _norm(df_p2["suspicion"]).eq("suspicious")
         if "suspicion" in df_p2.columns
@@ -1430,9 +1445,522 @@ def _confusion_matrix_html(conf: dict, n_total: int, accent: str = "#0771eb") ->
     )
 
 
+def _ai_inference_ipw_group_stats(g: pd.DataFrame) -> dict | None:
+    """IPW-reconstructed diagnostic stats for one group of phase-2 rows
+    (a single site, or the whole phase-2 dataset for "Total").
+
+    Phase-2's actual verification protocol does not send every case to
+    TSD: essentially all AI-suspicious cases are reviewed, but only a
+    sample of AI-non-suspicious cases are. A confusion matrix built only
+    from reviewed rows is therefore biased on the AI-non-suspicious side.
+
+    This applies inverse-probability weighting: each reviewed case is
+    re-weighted by the inverse of its own side's observed review rate
+    (AI-suspicious reviewed rate, AI-non-suspicious reviewed rate), so a
+    reviewed AI-non-suspicious case stands in for the AI-non-suspicious
+    cases that weren't reviewed. This mirrors the derivation of TP/FP/FN/TN
+    weighting, weight = 1 / (observed verification rate), used to
+    reconstruct the full-population confusion matrix from a partially
+    verified sample.
+    """
+    ai_col = _ai_result_col(g)
+    if ai_col is None or "provisional_diagnosis" not in g.columns:
+        return None
+
+    n_recruited = len(g)  # total phase-2 cases in this group, regardless of AI/TSD status
+
+    ai_s_m  = _present_mask(g[ai_col]) & _norm(g[ai_col]).eq("suspicious")
+    ai_ns_m = _present_mask(g[ai_col]) & _norm(g[ai_col]).eq("non suspicious")
+    reviewed = _phase2_reviewed_mask(g)
+    gt_susp = (
+        _norm(g["suspicion"]).eq("suspicious")
+        if "suspicion" in g.columns
+        else pd.Series(False, index=g.index)
+    )
+
+    n_ai_pos = int(ai_s_m.sum())
+    n_ai_neg = int(ai_ns_m.sum())
+    if n_ai_pos + n_ai_neg == 0:
+        return None
+
+    tp_obs = int((ai_s_m  & reviewed &  gt_susp).sum())
+    fp_obs = int((ai_s_m  & reviewed & ~gt_susp).sum())
+    fn_obs = int((ai_ns_m & reviewed &  gt_susp).sum())
+    tn_obs = int((ai_ns_m & reviewed & ~gt_susp).sum())
+
+    n_pos_reviewed = tp_obs + fp_obs   # reviewed among AI-suspicious
+    n_neg_reviewed = fn_obs + tn_obs   # reviewed among AI-non-suspicious
+
+    # weight = 1 / (observed verification rate) on each side. Falls back
+    # to 1 (no re-weighting) if a side has zero reviewed cases, to avoid
+    # a divide-by-zero — this under-corrects rather than fabricating a
+    # rate, so treat an all-1 weight side with caution.
+    w_pos = (n_ai_pos / n_pos_reviewed) if n_pos_reviewed else 1.0
+    w_neg = (n_ai_neg / n_neg_reviewed) if n_neg_reviewed else 1.0
+
+    tp = tp_obs * w_pos
+    fp = fp_obs * w_pos
+    fn = fn_obs * w_neg
+    tn = tn_obs * w_neg
+
+    n_total_w = tp + fp + fn + tn
+    sens = tp / (tp + fn) if (tp + fn) else float("nan")
+    spec = tn / (tn + fp) if (tn + fp) else float("nan")
+    acc  = (tp + tn) / n_total_w if n_total_w else float("nan")
+    ppv  = tp / (tp + fp) if (tp + fp) else float("nan")
+    npv  = tn / (tn + fn) if (tn + fn) else float("nan")
+    lr_pos = (sens / (1 - spec)) if pd.notna(spec) and (1 - spec) != 0 else float("nan")
+    lr_neg = ((1 - sens) / spec) if pd.notna(spec) and spec != 0 else float("nan")
+
+    n_reviewed = n_pos_reviewed + n_neg_reviewed
+    n_ai_total = n_ai_pos + n_ai_neg
+    n_ai_missing = n_recruited - n_ai_total
+    pos_review_pct = (n_pos_reviewed / n_ai_pos * 100) if n_ai_pos else float("nan")
+    neg_review_pct = (n_neg_reviewed / n_ai_neg * 100) if n_ai_neg else float("nan")
+
+    return {
+        "n_recruited": n_recruited,
+        "ts_susp": tp + fn, "ts_non_susp": fp + tn,
+        "ai_susp": n_ai_pos, "ai_non_susp": n_ai_neg, "ai_missing": n_ai_missing,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "sens": sens, "spec": spec, "acc": acc, "ppv": ppv, "npv": npv,
+        "lr_pos": lr_pos, "lr_neg": lr_neg,
+        "w_pos": w_pos, "w_neg": w_neg,
+        "n_reviewed": n_reviewed, "n_ai_total": n_ai_total,
+        "n_pos_reviewed": n_pos_reviewed, "pos_review_pct": pos_review_pct,
+        "n_neg_reviewed": n_neg_reviewed, "neg_review_pct": neg_review_pct,
+        "workload_pct": (n_reviewed / n_ai_total * 100) if n_ai_total else float("nan"),
+        "reduction_pct": (100 - n_reviewed / n_ai_total * 100) if n_ai_total else float("nan"),
+    }
+
+
+def _ai_inference_ipw_rows(df_p2: pd.DataFrame) -> tuple[list[tuple[str, dict]], dict | None]:
+    """Builds the (site, stats) rows plus the Total/Overall stats for the
+    IPW table. Site-wise rows are only produced when more than one site
+    is present in `df_p2` — i.e. when no site filter is currently
+    applied upstream; a single-site selection collapses to just the
+    overall row."""
+    total_stats = _ai_inference_ipw_group_stats(df_p2)
+    if total_stats is None:
+        return [], None
+
+    site_rows: list[tuple[str, dict]] = []
+    if "site_full_id" in df_p2.columns:
+        site_key = df_p2["site_full_id"].astype(str).str.strip()
+        sites = sorted(s for s in site_key.unique() if s)
+        if len(sites) > 1:
+            for site in sites:
+                stats = _ai_inference_ipw_group_stats(df_p2.loc[site_key == site])
+                if stats is not None:
+                    site_rows.append((site, stats))
+            site_rows.sort(key=lambda r: -r[1]["n_ai_total"])
+    return site_rows, total_stats
+
+
+# ── Prior-data triage projection ────────────────────────────────────────
+# Hardcoded site-wise PRIOR AI performance data (from an earlier/reference
+# dataset — distinct from the live phase-2 `df_p2` used above), used to
+# project expected AI+/AI− triage volumes and TSD yield under the actual
+# phase-2 triage protocol (AI+ → reviewed; AI− → sampled at a low rate).
+_PRIOR_SITE_DATA: dict[str, dict] = {
+    "KLE":         {"ts_susp": 891,  "ts_non_susp": 2546, "ai_susp": 1693, "ai_non_susp": 1744,
+                     "tp": 767,  "fp": 926,  "tn": 1620, "fn": 124,
+                     "sens": 0.8608, "spec": 0.6363, "acc": 0.6945, "ppv": 0.4530, "npv": 0.9289,
+                     "lr_pos": 2.3668, "lr_neg": 0.2187},
+    "AIIMS":       {"ts_susp": 1800, "ts_non_susp": 6166, "ai_susp": 3404, "ai_non_susp": 4562,
+                     "tp": 1482, "fp": 1922, "tn": 4244, "fn": 318,
+                     "sens": 0.8233, "spec": 0.6883, "acc": 0.7188, "ppv": 0.4354, "npv": 0.9303,
+                     "lr_pos": 2.6413, "lr_neg": 0.2567},
+    "MSMF":        {"ts_susp": 357,  "ts_non_susp": 761,  "ai_susp": 494,  "ai_non_susp": 624,
+                     "tp": 302,  "fp": 192,  "tn": 569,  "fn": 55,
+                     "sens": 0.8459, "spec": 0.7477, "acc": 0.7791, "ppv": 0.6113, "npv": 0.9119,
+                     "lr_pos": 3.3529, "lr_neg": 0.2060},
+    "KRISHNAGIRI": {"ts_susp": 194,  "ts_non_susp": 792,  "ai_susp": 469,  "ai_non_susp": 517,
+                     "tp": 148,  "fp": 321,  "tn": 471,  "fn": 46,
+                     "sens": 0.7629, "spec": 0.5947, "acc": 0.6278, "ppv": 0.3156, "npv": 0.9110,
+                     "lr_pos": 1.8823, "lr_neg": 0.3987},
+    "THANJAVUR":   {"ts_susp": 1865, "ts_non_susp": 5821, "ai_susp": 3358, "ai_non_susp": 4328,
+                     "tp": 1237, "fp": 2121, "tn": 3700, "fn": 628,
+                     "sens": 0.6633, "spec": 0.6356, "acc": 0.6423, "ppv": 0.3684, "npv": 0.8549,
+                     "lr_pos": 1.8203, "lr_neg": 0.5298},
+    "VARANASI":    {"ts_susp": 678,  "ts_non_susp": 2384, "ai_susp": 1333, "ai_non_susp": 1729,
+                     "tp": 537,  "fp": 796,  "tn": 1588, "fn": 141,
+                     "sens": 0.7920, "spec": 0.6661, "acc": 0.6940, "ppv": 0.4029, "npv": 0.9184,
+                     "lr_pos": 2.3721, "lr_neg": 0.3122},
+    "CACHAR":      {"ts_susp": 1025, "ts_non_susp": 2155, "ai_susp": 2182, "ai_non_susp": 998,
+                     "tp": 938,  "fp": 1244, "tn": 911,  "fn": 87,
+                     "sens": 0.9151, "spec": 0.4227, "acc": 0.5814, "ppv": 0.4299, "npv": 0.9128,
+                     "lr_pos": 1.5853, "lr_neg": 0.2008},
+    "BBCI":        {"ts_susp": 1740, "ts_non_susp": 8277, "ai_susp": 4023, "ai_non_susp": 5994,
+                     "tp": 1398, "fp": 2625, "tn": 5652, "fn": 342,
+                     "sens": 0.8034, "spec": 0.6829, "acc": 0.7038, "ppv": 0.3475, "npv": 0.9429,
+                     "lr_pos": 2.5334, "lr_neg": 0.2878},
+    "GOA":         {"ts_susp": 1012, "ts_non_susp": 1327, "ai_susp": 1322, "ai_non_susp": 1017,
+                     "tp": 810,  "fp": 512,  "tn": 815,  "fn": 202,
+                     "sens": 0.8004, "spec": 0.6142, "acc": 0.6947, "ppv": 0.6127, "npv": 0.8014,
+                     "lr_pos": 2.0745, "lr_neg": 0.3250},
+}
+
+
+def _match_actual_review_rates(
+    prior_site_key: str, site_rows: list[tuple[str, dict]], total_stats: dict | None
+) -> tuple[float, float, str]:
+    """Looks up the ACTUAL observed AI-Susp./AI-Non-Susp. TSD review rates
+    (as already computed for the 'IPW-Reconstructed Diagnostics — AI vs
+    TSD' table) for a given prior-data site key, by matching it against
+    the live phase-2 site names. If one or more live sites match (e.g.
+    'GOA' matching multiple Goa sub-sites), their raw reviewed/AI-screened
+    counts are pooled before computing the rate, and their names are
+    returned joined by ' + '. Falls back to the overall Total row's rates
+    when no live site matches, returning '-' as the matched-site name.
+    Returns (ai_pos_rate, ai_neg_rate, matched_site_name)."""
+    key_up = prior_site_key.upper()
+    matches = [
+        (name, stats) for name, stats in site_rows
+        if key_up in name.upper()
+    ]
+    if matches:
+        n_pos_reviewed = sum(s["n_pos_reviewed"] for _, s in matches)
+        n_ai_pos = sum(s["ai_susp"] for _, s in matches)
+        n_neg_reviewed = sum(s["n_neg_reviewed"] for _, s in matches)
+        n_ai_neg = sum(s["ai_non_susp"] for _, s in matches)
+        ai_pos_rate = (n_pos_reviewed / n_ai_pos) if n_ai_pos else float("nan")
+        ai_neg_rate = (n_neg_reviewed / n_ai_neg) if n_ai_neg else float("nan")
+        matched_name = " + ".join(name for name, _ in matches)
+        return ai_pos_rate, ai_neg_rate, matched_name
+
+    if total_stats is not None:
+        return (
+            total_stats["pos_review_pct"] / 100 if pd.notna(total_stats["pos_review_pct"]) else float("nan"),
+            total_stats["neg_review_pct"] / 100 if pd.notna(total_stats["neg_review_pct"]) else float("nan"),
+            "-",
+        )
+    return float("nan"), float("nan"), "-"
+
+
+def _triage_projection_rows(
+    site_rows: list[tuple[str, dict]],
+    total_stats: dict | None,
+    prior_data: dict[str, dict] = _PRIOR_SITE_DATA,
+) -> list[tuple[str, dict]]:
+    """For each site's PRIOR AI performance (prevalence, sensitivity,
+    specificity, PPV, NPV), projects the expected AI+/AI− triage split and
+    the resulting expected TSD-review workload/yield — using the ACTUAL
+    site-specific (or, failing a match, overall) AI-Susp./AI-Non-Susp. TSD
+    review rates already observed in the live phase-2 data (the same rates
+    shown in the 'IPW-Reconstructed Diagnostics — AI vs TSD' table above),
+    rather than an assumed 100%/5% triage rule."""
+    rows: list[tuple[str, dict]] = []
+    for site, d in prior_data.items():
+        n_ts = d["ts_susp"] + d["ts_non_susp"]
+        prevalence = d["ts_susp"] / n_ts if n_ts else float("nan")
+        sens, spec = d["sens"], d["spec"]
+        ppv, npv = d["ppv"], d["npv"]
+
+        ai_pos_rate, ai_neg_rate, matched_site_name = _match_actual_review_rates(
+            site, site_rows, total_stats
+        )
+
+        p_ai_pos = prevalence * sens + (1 - prevalence) * (1 - spec)
+        p_ai_neg = 1 - p_ai_pos
+
+        # Full-population confusion cells (as if every case were TSD-verified)
+        tp = p_ai_pos * ppv
+        fp = p_ai_pos * (1 - ppv)
+        fn_population = p_ai_neg * (1 - npv)
+        tn_population = p_ai_neg * npv
+
+        # Only the actual observed review rate of each side is ever
+        # TSD-verified, so only that fraction of population TP/FP/FN/TN
+        # is *observed* by TSD
+        tp_observed = tp * ai_pos_rate
+        fp_observed = fp * ai_pos_rate
+        fn_observed = fn_population * ai_neg_rate
+        tn_observed = tn_population * ai_neg_rate
+
+        p_tsd_pos = tp_observed + fn_observed
+        p_tsd_neg = fp_observed + tn_observed
+        p_reviewed = p_ai_pos * ai_pos_rate + p_ai_neg * ai_neg_rate
+        p_no_tsd = p_ai_pos * (1 - ai_pos_rate) + p_ai_neg * (1 - ai_neg_rate)
+        p_tsd_pos_among_referred = (p_tsd_pos / p_reviewed) if p_reviewed else float("nan")
+
+        rows.append((site, {
+            "prevalence": prevalence, "sens": sens, "spec": spec,
+            "ppv": ppv, "npv": npv,
+            "p_ai_pos": p_ai_pos, "p_ai_neg": p_ai_neg,
+            "ai_pos_rate": ai_pos_rate, "ai_neg_rate": ai_neg_rate,
+            "matched_site_name": matched_site_name,
+            "tp": tp, "fp": fp,
+            "fn_population": fn_population, "tn_population": tn_population,
+            "tp_observed": tp_observed, "fp_observed": fp_observed,
+            "fn_observed": fn_observed, "tn_observed": tn_observed,
+            "p_tsd_pos": p_tsd_pos, "p_tsd_neg": p_tsd_neg,
+            "p_reviewed": p_reviewed, "p_no_tsd": p_no_tsd,
+            "p_tsd_pos_among_referred": p_tsd_pos_among_referred,
+        }))
+    return rows
+
+
+def _triage_projection_table_html(rows: list[tuple[str, dict]], accent: str = "#0771eb") -> str:
+    """Renders the prior-data triage projection table: expected AI+/AI−
+    split and expected TSD workload/yield per site, derived from each
+    site's PRIOR (reference) prevalence + AI sensitivity/specificity/PPV/
+    NPV, combined with the ACTUAL observed AI-Susp./AI-Non-Susp. TSD
+    review rates from the live phase-2 IPW table above (not an assumed
+    100%/5% rule). The 'Matched IPW Site' column shows the live site name
+    (from the 'IPW-Reconstructed Diagnostics — AI vs TSD' table) whose
+    review rates were used; '-' means no direct match was found, so the
+    overall Total row's rates were used instead."""
+    labels = [
+        "Matched IPW Site",
+        "Prevalence", "AI Sens.", "AI Spec.", "AI PPV", "AI NPV",
+        "P(AI+)", "P(AI−)",
+        "AI+ Sent to TSD %", "AI− Sent to TSD %",
+        "TP", "FP", "FN (Population)", "TN (Population)",
+        "TP (Observed)", "FP (Observed)", "FN (Observed)", "TN (Observed)",
+        "Exp. TSD+ %", "Exp. TSD− %", "TSD+ Among Referrals %",
+        "Exp. Reviewed %", "Exp. No-TSD %",
+    ]
+
+    def fmt_pct(v: float) -> str:
+        return f"{v * 100:.1f}%" if pd.notna(v) else "—"
+
+    def fmt_ratio(v: float) -> str:
+        return f"{v:.3f}" if pd.notna(v) else "—"
+
+    header_cells = "".join(
+        "<th style='padding:8px 8px;text-align:right;font-size:11px;font-weight:800;"
+        "letter-spacing:.3px;text-transform:uppercase;color:#555;"
+        "border-left:1px solid #eee;white-space:nowrap;'>"
+        f"{html.escape(lbl)}</th>"
+        for lbl in labels
+    )
+
+    def row_html(site: str, d: dict) -> str:
+        vals_ratio = [d["prevalence"], d["sens"], d["spec"], d["ppv"], d["npv"]]
+        vals_pct = [
+            d["p_ai_pos"], d["p_ai_neg"],
+            d["ai_pos_rate"], d["ai_neg_rate"],
+            d["tp"], d["fp"], d["fn_population"], d["tn_population"],
+            d["tp_observed"], d["fp_observed"], d["fn_observed"], d["tn_observed"],
+            d["p_tsd_pos"], d["p_tsd_neg"], d["p_tsd_pos_among_referred"],
+            d["p_reviewed"], d["p_no_tsd"],
+        ]
+        matched_cell = (
+            f"<td style='padding:6px 8px;text-align:right;font-weight:600;color:#333;"
+            f"border-top:1px solid #f0f0f0;border-left:1px solid #f5f5f5;white-space:nowrap;'>"
+            f"{html.escape(d['matched_site_name'])}</td>"
+        )
+        cells = matched_cell + "".join(
+            f"<td style='padding:6px 8px;text-align:right;font-weight:600;color:#333;"
+            f"border-top:1px solid #f0f0f0;border-left:1px solid #f5f5f5;'>{fmt_ratio(v)}</td>"
+            for v in vals_ratio
+        ) + "".join(
+            f"<td style='padding:6px 8px;text-align:right;font-weight:600;color:#333;"
+            f"border-top:1px solid #f0f0f0;border-left:1px solid #f5f5f5;'>{fmt_pct(v)}</td>"
+            for v in vals_pct
+        )
+        return (
+            "<tr>"
+            f"<td style='padding:6px 8px;font-weight:700;color:#333;"
+            f"border-top:1px solid #f0f0f0;white-space:nowrap;'>{html.escape(site)}</td>"
+            f"{cells}</tr>"
+        )
+
+    body_rows = "".join(row_html(site, d) for site, d in rows)
+
+    return (
+        "<div style='overflow-x:auto;'>"
+        "<table style='border-collapse:collapse;width:100%;font-size:13px;"
+        "font-family:inherit;'>"
+        "<thead><tr>"
+        "<th style='padding:8px 8px;text-align:left;font-size:11px;font-weight:800;"
+        "letter-spacing:.3px;text-transform:uppercase;color:#555;'>Site</th>"
+        f"{header_cells}</tr></thead>"
+        f"<tbody>{body_rows}</tbody>"
+        "</table></div>"
+    )
+
+
+def _ipw_table_html(
+    site_rows: list[tuple[str, dict]], total_stats: dict, accent: str = "#0771eb"
+) -> str:
+    """Renders the site-wise (+ Total) IPW-reconstructed diagnostic table,
+    in the same plain bordered-table style as the confusion matrix. Includes
+    the AI-suspicious / AI-non-suspicious weight factor used to inflate each
+    site's observed (reviewed-only) counts up to its IPW-reconstructed
+    counts."""
+    recruited_label = ["Total Recruited (P2)"]
+    missing_label = ["AI Result Missing"]
+    pos_group_labels = ["AI-Susp. TSD Review %", "W (AI+)"]
+    neg_group_labels = ["AI-Non-Susp. TSD Review %", "W (AI−)"]
+    count_labels = ["AI Susp.", "AI Non-Susp.", "TS Susp.*", "TS Non-Susp.*"]
+    recon_labels = ["AI TP*", "AI FP*", "AI TN*", "AI FN*"]
+    ratio_labels = ["Sens.", "Spec.", "Acc.", "PPV", "NPV", "LR+", "LR-"]
+    workload_labels = ["TSD Review %", "Workload Reduction %"]
+
+    def fmt_count(v: float) -> str:
+        return f"{v:,.0f}" if pd.notna(v) else "—"
+
+    def fmt_weight(v: float) -> str:
+        return f"{v:.2f}×" if pd.notna(v) else "—"
+
+    def fmt_ratio(v: float) -> str:
+        return f"{v:.3f}" if pd.notna(v) else "—"
+
+    def fmt_pct(v: float) -> str:
+        return f"{v:.1f}%" if pd.notna(v) else "—"
+
+    def row_cells(stats: dict, bold: bool = False) -> str:
+        color = accent if bold else "#333"
+        weight_wt = "800" if bold else "600"
+
+        def cells_for(values, fmt):
+            return "".join(
+                f"<td style='padding:6px 8px;text-align:right;font-weight:{weight_wt};color:{color};"
+                f"border-top:1px solid #f0f0f0;border-left:1px solid #f5f5f5;'>{fmt(v)}</td>"
+                for v in values
+            )
+
+        recruited = [stats["n_recruited"]]
+        missing = [stats["ai_missing"]]
+        counts = [
+            stats["ai_susp"], stats["ai_non_susp"],
+            stats["ts_susp"], stats["ts_non_susp"],
+        ]
+        recon = [stats["tp"], stats["fp"], stats["tn"], stats["fn"]]
+        ratios = [
+            stats["sens"], stats["spec"], stats["acc"], stats["ppv"], stats["npv"],
+            stats["lr_pos"], stats["lr_neg"],
+        ]
+        workload = [stats["workload_pct"], stats["reduction_pct"]]
+        return (
+            cells_for(recruited, fmt_count)
+            + cells_for(missing, fmt_count)
+            + cells_for([stats["pos_review_pct"]], fmt_pct)
+            + cells_for([stats["w_pos"]], fmt_weight)
+            + cells_for([stats["neg_review_pct"]], fmt_pct)
+            + cells_for([stats["w_neg"]], fmt_weight)
+            + cells_for(counts, fmt_count)
+            + cells_for(recon, fmt_count)
+            + cells_for(ratios, fmt_ratio)
+            + cells_for(workload, fmt_pct)
+        )
+
+    header_cells = "".join(
+        "<th style='padding:8px 8px;text-align:right;font-size:11px;font-weight:800;"
+        "letter-spacing:.3px;text-transform:uppercase;color:#555;"
+        "border-left:1px solid #eee;white-space:nowrap;'>"
+        f"{html.escape(lbl)}</th>"
+        for lbl in (
+            recruited_label + missing_label + pos_group_labels + neg_group_labels
+            + count_labels + recon_labels + ratio_labels + workload_labels
+        )
+    )
+
+    body_rows = [
+        "<tr><td style='padding:6px 8px;text-align:left;font-weight:600;color:#333;"
+        f"border-top:1px solid #f0f0f0;white-space:nowrap;'>{html.escape(site)}</td>"
+        f"{row_cells(stats)}</tr>"
+        for site, stats in site_rows
+    ]
+    body_rows.append(
+        "<tr><td style='padding:6px 8px;text-align:left;font-weight:800;"
+        f"color:{accent};border-top:2px solid #ddd;white-space:nowrap;'>"
+        f"{'Total' if site_rows else 'Overall'}</td>"
+        f"{row_cells(total_stats, bold=True)}</tr>"
+    )
+
+    return (
+        "<div style='overflow-x:auto;margin-bottom:6px;'>"
+        "<table style='border-collapse:collapse;background:#fff;border-radius:10px;"
+        "overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);width:100%;'>"
+        "<thead><tr style='background:#fafafa;'>"
+        "<th style='padding:8px 8px;text-align:left;font-size:11px;font-weight:800;"
+        "letter-spacing:.3px;text-transform:uppercase;color:#555;white-space:nowrap;'>"
+        f"Site</th>{header_cells}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody></table></div>"
+    )
+
+
+def _weighted_confusion_matrix_html(stats: dict, accent: str = "#0771eb") -> str:
+    """IPW-reconstructed confusion matrix — same 2x2 layout as
+    `_confusion_matrix_html`, but the cells are the weighted (estimated)
+    TP/FP/TN/FN counts (floats, rounded for display) instead of raw
+    observed counts, since every AI-non-suspicious reviewed case has been
+    inflated by 1 / (its side's observed verification rate)."""
+    tp, fp, fn, tn = stats["tp"], stats["fp"], stats["fn"], stats["tn"]
+
+    core = [[tn, fp], [fn, tp]]
+    row_totals = [tn + fp, fn + tp]
+    col_totals = [tn + fn, fp + tp]
+    n_total = tp + fp + fn + tn
+
+    col_labels = ["AI: Non-suspicious (0)", "AI: Suspicious (1)", "Total"]
+    row_labels = ["TSD: Non-suspicious (0)", "TSD: Suspicious (1)", "Total"]
+
+    def fmt(v: float) -> str:
+        return f"{v:,.0f}"
+
+    header_cells = "".join(
+        "<th style='padding:8px 10px;text-align:center;font-size:12px;"
+        "font-weight:800;letter-spacing:.5px;text-transform:uppercase;"
+        f"color:{accent if c == 'Total' else '#555'};border-left:1px solid #eee;'>"
+        f"{html.escape(c)}</th>"
+        for c in col_labels
+    )
+
+    body_rows = []
+    for yi in range(2):
+        cells = "".join(
+            "<td style='padding:6px 10px;text-align:center;"
+            "font-weight:700;color:#333;border-top:1px solid #f0f0f0;"
+            "border-left:1px solid #f5f5f5;'>"
+            f"{fmt(core[yi][xi])}</td>"
+            for xi in range(2)
+        )
+        total_cell = (
+            f"<td style='padding:6px 10px;text-align:center;font-weight:800;"
+            f"color:{accent};border-top:1px solid #f0f0f0;"
+            f"border-left:1px solid #f5f5f5;'>{fmt(row_totals[yi])}</td>"
+        )
+        body_rows.append(
+            "<tr><td style='padding:6px 10px;text-align:left;font-weight:600;"
+            "color:#333;border-top:1px solid #f0f0f0;'>"
+            f"{html.escape(row_labels[yi])}</td>{cells}{total_cell}</tr>"
+        )
+
+    total_cells = "".join(
+        f"<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        f"color:{accent};border-top:2px solid #ddd;"
+        f"border-left:1px solid #f5f5f5;'>{fmt(col_totals[xi])}</td>"
+        for xi in range(2)
+    )
+    body_rows.append(
+        f"<tr><td style='padding:6px 10px;text-align:left;font-weight:800;"
+        f"color:{accent};border-top:2px solid #ddd;'>Total</td>{total_cells}"
+        f"<td style='padding:6px 10px;text-align:center;font-weight:800;"
+        f"color:{accent};border-top:2px solid #ddd;"
+        f"border-left:1px solid #f5f5f5;'>{fmt(n_total)}</td></tr>"
+    )
+
+    return (
+        "<div style='overflow-x:auto;margin-bottom:6px;'>"
+        "<table style='border-collapse:collapse;background:#fff;"
+        "border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);'>"
+        "<thead><tr style='background:#fafafa;'>"
+        "<th style='padding:8px 10px;text-align:left;font-size:12px;font-weight:800;"
+        "letter-spacing:.5px;text-transform:uppercase;color:#555;'>"
+        "TSD \\ AI Result</th>"
+        f"{header_cells}</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div>"
+    )
+
+
 def _render_ai_inference(df_p2: pd.DataFrame) -> None:
     """AI Inference tab: phase-2 confusion matrix (AI Result vs TSD
-    Suspicion), with row/column totals."""
+    Suspicion), with row/column totals, plus a site-wise (and Total/
+    Overall) IPW-reconstructed diagnostic table and the resulting
+    TSD-workload reduction from AI triage."""
     conf = _ai_inference_confusion(df_p2)
     n_total = conf["tp"] + conf["fp"] + conf["fn"] + conf["tn"]
     if n_total == 0:
@@ -1442,22 +1970,126 @@ def _render_ai_inference(df_p2: pd.DataFrame) -> None:
         )
         return
 
-    st.markdown(
-        "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
-        "🧩 Confusion Matrix — AI vs TSD</div>",
-        unsafe_allow_html=True,
-    )
+    site_rows, total_stats = _ai_inference_ipw_rows(df_p2)
+
     col_left, col_right = st.columns([1, 1])
     with col_left:
+        st.markdown(
+            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
+            "🧩 Confusion Matrix — AI vs TSD</div>",
+            unsafe_allow_html=True,
+        )
         st.markdown(
             _confusion_matrix_html(conf, n_total),
             unsafe_allow_html=True,
         )
         st.markdown(
             f"<div style='font-size:13px;color:#888;margin-top:-2px;'>"
-            f"n = {n_total:,} phase-2 cases with a completed TSD review</div>",
+            f"n = {n_total:,} phase-2 cases with both an AI diagnosis and a "
+            f"TSD diagnosis</div>",
             unsafe_allow_html=True,
         )
+
+    with col_right:
+        if total_stats is None:
+            st.info("Not enough data to compute IPW-adjusted diagnostics.")
+        else:
+            n_total_w = total_stats["tp"] + total_stats["fp"] + total_stats["fn"] + total_stats["tn"]
+            st.markdown(
+                "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
+                "⚖️ Weighted Confusion Matrix — AI vs TSD (IPW)</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                _weighted_confusion_matrix_html(total_stats),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div style='font-size:13px;color:#888;margin-top:-2px;'>"
+                f"n ≈ {n_total_w:,.0f} IPW-reconstructed cases — weights: "
+                f"AI-suspicious ×{total_stats['w_pos']:.2f}, "
+                f"AI-non-suspicious ×{total_stats['w_neg']:.2f}</div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── New row: site-wise (+ Total) IPW-reconstructed diagnostics table ──
+    if total_stats is not None:
+        st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
+            "📋 IPW-Reconstructed Diagnostics — AI vs TSD</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            _ipw_table_html(site_rows, total_stats),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div style='font-size:13px;color:#888;margin-top:-2px;'>"
+            "Reconstructed via inverse-probability weighting: each reviewed "
+            "AI-suspicious/AI-non-suspicious case is re-weighted (W columns) by "
+            "the inverse of its own side's observed TSD-review rate, correcting "
+            "for phase-2's partial verification of AI-non-suspicious cases. "
+            "<b>*</b> = IPW-reconstructed (weighted/extrapolated) value across "
+            "all AI-screened cases, not a raw observed count from reviewed "
+            "cases alone."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── New row: prior-data triage projection table ──
+    st.markdown("<div style='margin-top:22px;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
+        "📊 Prior-Data Triage Projection — Expected AI/TSD Split by Site</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _triage_projection_table_html(
+            _triage_projection_rows(site_rows, total_stats)
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div style='font-size:13px;color:#888;margin-top:-2px;'>"
+        "Uses each site's <b>prior</b> (reference-dataset) prevalence, AI "
+        "sensitivity/specificity/PPV/NPV — not the live phase-2 data above. "
+        "P(AI+) = Prevalence×Sens. + (1−Prevalence)×(1−Spec.); P(AI−) = 1−P(AI+). "
+        "'AI+/AI− Sent to TSD %' are the <b>actual observed</b> "
+        "AI-Susp./AI-Non-Susp. TSD review rates from the IPW table above "
+        "(site-matched where possible; '-' in the Matched IPW Site column = "
+        "no direct site match, so the overall Total row's rates were used) — "
+        "not an assumed 100%/5% rule. "
+        "Full-population cells: TP = P(AI+)×PPV, FP = P(AI+)×(1−PPV), "
+        "FN (Population) = P(AI−)×(1−NPV), TN (Population) = P(AI−)×NPV — as if "
+        "every case were TSD-verified. Multiplying each by its side's actual "
+        "review rate gives the <i>Observed</i> cells (TP/FP by the AI+ rate, "
+        "FN/TN by the AI− rate) — only what TSD would actually see under the "
+        "real triage pathway. Exp. TSD+ % = TP (Observed) + FN (Observed); "
+        "Exp. TSD− % = FP (Observed) + TN (Observed); TSD+ Among Referrals % "
+        "= Exp. TSD+ % ÷ Exp. Reviewed %. IPW reverses the AI− side: FN "
+        "(Observed) ÷ AI− Sent to TSD % ≈ FN (Population)."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    if total_stats is not None:
+        workload_pct = total_stats["workload_pct"]
+        reduction_pct = 100 - workload_pct if pd.notna(workload_pct) else float("nan")
+        if pd.notna(reduction_pct):
+            st.markdown(
+                "<div style='margin-top:14px;padding:12px 16px;background:#f3f8ff;"
+                "border-left:4px solid #0771eb;border-radius:6px;font-size:14px;"
+                "color:#333;'>"
+                f"📉 Based on the actual phase-2 verification pattern, only "
+                f"<b>{workload_pct:.1f}%</b> of {total_stats['n_ai_total']:,} "
+                f"AI-screened cases ({total_stats['n_reviewed']:,.0f}) required a "
+                f"TSD review — so the AI-triage strategy is reducing TSD workload "
+                f"by approximately <b>{reduction_pct:.1f}%</b> versus reviewing "
+                "every case."
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # ════════════════════════════════════════════════════════════════════
