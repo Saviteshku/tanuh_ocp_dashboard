@@ -1860,24 +1860,36 @@ def _ipw_table_html(
 
     body_rows = [
         "<tr><td style='padding:6px 8px;text-align:left;font-weight:600;color:#333;"
-        f"border-top:1px solid #f0f0f0;white-space:nowrap;'>{html.escape(site)}</td>"
+        "border-top:1px solid #f0f0f0;white-space:nowrap;"
+        "position:sticky;left:0;z-index:1;background:#fff;"
+        f"box-shadow:1px 0 0 #eee;'>{html.escape(site)}</td>"
         f"{row_cells(stats)}</tr>"
         for site, stats in site_rows
     ]
     body_rows.append(
         "<tr><td style='padding:6px 8px;text-align:left;font-weight:800;"
-        f"color:{accent};border-top:2px solid #ddd;white-space:nowrap;'>"
+        f"color:{accent};border-top:2px solid #ddd;white-space:nowrap;"
+        "position:sticky;left:0;z-index:1;background:#fff;"
+        f"box-shadow:1px 0 0 #eee;'>"
         f"{'Total' if site_rows else 'Overall'}</td>"
         f"{row_cells(total_stats, bold=True)}</tr>"
     )
 
     return (
-        "<div style='overflow-x:auto;margin-bottom:6px;'>"
-        "<table style='border-collapse:collapse;background:#fff;border-radius:10px;"
-        "overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);width:100%;'>"
+        # NOTE: no `overflow:hidden` on the wrapper or the table here.
+        # That property (previously used to clip the table into rounded
+        # corners) also clips off position:sticky's stacking context in
+        # most browsers, which silently breaks the frozen Site column.
+        # border-radius is still applied to the table via `border-spacing`
+        # + separate borders below so the sticky column keeps working.
+        "<div style='overflow-x:auto;margin-bottom:6px;border-radius:10px;"
+        "box-shadow:0 2px 12px rgba(0,0,0,.06);'>"
+        "<table style='border-collapse:separate;border-spacing:0;background:#fff;width:100%;'>"
         "<thead><tr style='background:#fafafa;'>"
         "<th style='padding:8px 8px;text-align:left;font-size:11px;font-weight:800;"
-        "letter-spacing:.3px;text-transform:uppercase;color:#555;white-space:nowrap;'>"
+        "letter-spacing:.3px;text-transform:uppercase;color:#555;white-space:nowrap;"
+        "position:sticky;left:0;z-index:2;background:#fafafa;"
+        "box-shadow:1px 0 0 #eee;'>"
         f"Site</th>{header_cells}</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody></table></div>"
     )
@@ -2110,11 +2122,17 @@ def _render_site_table(df: pd.DataFrame) -> None:
     if dates.empty:
         st.info("No valid dates available.")
         return
-    max_dt = dates.max()
-    last_lbl = max_dt.strftime("%b %Y")
+    # "Screened in <month>" always reflects the actual current calendar
+    # month (today's date), not the most recent date present in the
+    # data — so the column header and mask stay correct (e.g. "Sep
+    # 2026") even if no cases have been registered yet this month. Any
+    # site with zero cases in that month shows "–" rather than "0"
+    # further down.
+    today = pd.Timestamp.now()
+    last_lbl = today.strftime("%b %Y")
     current_month_mask = (
-        (df["date_of_case_registered"].dt.year == max_dt.year) &
-        (df["date_of_case_registered"].dt.month == max_dt.month)
+        (df["date_of_case_registered"].dt.year == today.year) &
+        (df["date_of_case_registered"].dt.month == today.month)
     )
 
     # 2. Site-wise aggregates
@@ -2171,6 +2189,23 @@ def _render_site_table(df: pd.DataFrame) -> None:
     else:
         min_date_by_site = pd.Series(dtype="datetime64[ns]")
         max_date_by_site = pd.Series(dtype="datetime64[ns]")
+
+    # Start date broken out by phase — a site can span more than one
+    # phase (see phase_by_site above), so instead of a single earliest
+    # date across all of a site's records, compute the earliest date
+    # separately for each phase the site appears in. Keyed by
+    # (site_full_id, phase-as-int) so it can be looked up per phase
+    # while building each row's "Start Date" cell below.
+    if "date_of_case_registered" in df.columns and "phase" in df.columns:
+        _phase_int = pd.to_numeric(df["phase"], errors="coerce")
+        _phase_valid = _phase_int.notna()
+        min_date_by_site_phase = (
+            df.loc[_phase_valid, "date_of_case_registered"]
+            .groupby([site_key[_phase_valid], _phase_int[_phase_valid].astype(int)])
+            .min()
+        )
+    else:
+        min_date_by_site_phase = pd.Series(dtype="datetime64[ns]")
 
     # Retrieval date (date-only) per site — the most recent
     # "retrieval_date_time" seen for that site, from the cron
@@ -2230,7 +2265,7 @@ def _render_site_table(df: pd.DataFrame) -> None:
             cur_screened_display = "–"
         else:
             cur_screened = int(cur_month_by_site.get(site, 0))
-            cur_screened_display = f"{cur_screened:,}"
+            cur_screened_display = f"{cur_screened:,}" if cur_screened else "–"
 
         site_type_str = str(site_type_by_site.get(site, "") or "—")
         _st_lower = site_type_str.strip().lower()
@@ -2241,8 +2276,31 @@ def _render_site_table(df: pd.DataFrame) -> None:
         else:
             site_type_color = "#555"
 
-        min_dt = min_date_by_site.get(site)
-        start_date_str = min_dt.strftime('%d-%b-%Y') if pd.notna(min_dt) else "—"
+        phase_str = str(phase_by_site.get(site, "—"))
+
+        # Start Date, broken out by phase. phase_str looks like "1" or
+        # "1 & 2" (see _phase_label above); for each phase listed there,
+        # look up that phase's own earliest date and stack them in the
+        # same cell (e.g. "Phase 1: 01-Jan-2024<br>Phase 2: 05-Mar-2024").
+        # Falls back to the site's overall earliest date if per-phase
+        # lookup isn't available (e.g. no "phase" column in the data).
+        phase_nums = [p.strip() for p in phase_str.split("&") if p.strip()]
+        start_date_parts = []
+        for p in phase_nums:
+            try:
+                p_int = int(p)
+            except ValueError:
+                continue
+            dt = min_date_by_site_phase.get((site, p_int))
+            if pd.notna(dt):
+                start_date_parts.append(
+                    f"Phase {p_int}: {html.escape(dt.strftime('%d-%b-%Y'))}"
+                )
+        if start_date_parts:
+            start_date_str = "<br>".join(start_date_parts)
+        else:
+            min_dt = min_date_by_site.get(site)
+            start_date_str = html.escape(min_dt.strftime('%d-%b-%Y')) if pd.notna(min_dt) else "—"
 
         max_dt_site = max_date_by_site.get(site)
         recent_date_str = max_dt_site.strftime('%d-%b-%Y') if pd.notna(max_dt_site) else "—"
@@ -2257,8 +2315,6 @@ def _render_site_table(df: pd.DataFrame) -> None:
         else:
             retrieval_date_str = "—"
 
-        phase_str = str(phase_by_site.get(site, "—"))
-
         rows_html.append(
             "<tr>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
@@ -2270,7 +2326,7 @@ def _render_site_table(df: pd.DataFrame) -> None:
             f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
             f"color:#555;border-top:1px solid #eee;white-space:nowrap;line-height:1.4;'>{retrieval_date_str}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
-            f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(start_date_str)}</td>"
+            f"color:#555;border-top:1px solid #eee;white-space:nowrap;line-height:1.4;'>{start_date_str}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:600;"
             f"color:#555;border-top:1px solid #eee;white-space:nowrap;'>{html.escape(recent_date_str)}</td>"
             f"<td style='padding:5px 10px;text-align:center;font-weight:700;"
@@ -2313,7 +2369,7 @@ def _render_site_table(df: pd.DataFrame) -> None:
         "<td style='padding:6px 10px;text-align:center;font-weight:800;"
         "color:#999;border-top:2px solid #ddd;'>–</td>"
         "<td style='padding:6px 10px;text-align:center;font-weight:800;"
-        f"color:#4CA64C;border-top:2px solid #ddd;'>{total_cur_screened:,}</td>"
+        f"color:#4CA64C;border-top:2px solid #ddd;'>{f'{total_cur_screened:,}' if total_cur_screened else '–'}</td>"
         "<td style='padding:6px 10px;text-align:center;font-weight:800;"
         f"color:#228B22;border-top:2px solid #ddd;'>{total_screened:,}</td>"
         "<td style='padding:6px 10px;text-align:center;font-weight:800;"
@@ -2719,76 +2775,37 @@ def _render_lesion_suspicion_crosstabs(df_all: pd.DataFrame, df_p2: pd.DataFrame
     )
     st.markdown(
         "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
-        "🩺 Lesion/Patch × Suspicion — Overall vs. by AI Result</div>",
+        "🩺 Lesion/Patch × Suspicion — Overall</div>",
         unsafe_allow_html=True,
     )
 
-    col_a, col_b, col_c = st.columns(3)
-
-    with col_a:
-        ct, pct = _row_pct_crosstab(
-            df_all, "suspicion", "lesion_patch",
-            row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
+    ct, pct = _row_pct_crosstab(
+        df_all, "suspicion", "lesion_patch",
+        row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
+    )
+    if ct is None:
+        st.info("No cases with both Lesion/Patch and Suspicion completed.")
+    else:
+        st.markdown(
+            _row_pct_crosstab_html(
+                ct, pct, "Suspicion", "Lesion/Patch",
+                "📋 Overall", "#0771eb", int(ct.loc["Total", "Total"]),
+            ),
+            unsafe_allow_html=True,
         )
-        if ct is None:
-            st.info("No cases with both Lesion/Patch and Suspicion completed.")
-        else:
-            st.markdown(
-                _row_pct_crosstab_html(
-                    ct, pct, "Suspicion", "Lesion/Patch",
-                    "📋 Overall", "#0771eb", int(ct.loc["Total", "Total"]),
-                ),
-                unsafe_allow_html=True,
-            )
-            # Sensitivity/specificity etc. are defined relative to
-            # Lesion/Patch as the index test and Suspicion as the
-            # reference standard — that mapping is independent of how
-            # the table above is displayed, so compute it off a
-            # lesion-as-row/suspicion-as-column crosstab, not off the
-            # display-oriented `ct` above.
-            ct_stats, _ = _row_pct_crosstab(
-                df_all, "lesion_patch", "suspicion",
-                row_canon=_LESION_CANON, col_canon=_SUSPICION_CANON,
-            )
-            stats = _diag_accuracy(ct_stats) if ct_stats is not None else None
-            if stats:
-                st.markdown(_diag_accuracy_html(stats, "#0771eb"), unsafe_allow_html=True)
-
-    ai_col = _ai_result_col(df_p2) if not df_p2.empty else None
-    susp_sub = df_p2.loc[_norm(df_p2[ai_col]).eq("suspicious")] if ai_col else df_p2.iloc[0:0]
-    non_sub = df_p2.loc[_norm(df_p2[ai_col]).eq("non suspicious")] if ai_col else df_p2.iloc[0:0]
-
-    with col_b:
-        ct, pct = _row_pct_crosstab(
-            susp_sub, "suspicion", "lesion_patch",
-            row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
+        # Sensitivity/specificity etc. are defined relative to
+        # Lesion/Patch as the index test and Suspicion as the
+        # reference standard — that mapping is independent of how
+        # the table above is displayed, so compute it off a
+        # lesion-as-row/suspicion-as-column crosstab, not off the
+        # display-oriented `ct` above.
+        ct_stats, _ = _row_pct_crosstab(
+            df_all, "lesion_patch", "suspicion",
+            row_canon=_LESION_CANON, col_canon=_SUSPICION_CANON,
         )
-        if ct is None:
-            st.info("No Suspicious phase-2 cases with both fields completed.")
-        else:
-            st.markdown(
-                _row_pct_crosstab_html(
-                    ct, pct, "Suspicion", "Lesion/Patch",
-                    "🟠 AI: Suspicious", "#F4A900", int(ct.loc["Total", "Total"]),
-                ),
-                unsafe_allow_html=True,
-            )
-
-    with col_c:
-        ct, pct = _row_pct_crosstab(
-            non_sub, "suspicion", "lesion_patch",
-            row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
-        )
-        if ct is None:
-            st.info("No Non-suspicious phase-2 cases with both fields completed.")
-        else:
-            st.markdown(
-                _row_pct_crosstab_html(
-                    ct, pct, "Suspicion", "Lesion/Patch",
-                    "🟢 AI: Non-Suspicious", "#228B22", int(ct.loc["Total", "Total"]),
-                ),
-                unsafe_allow_html=True,
-            )
+        stats = _diag_accuracy(ct_stats) if ct_stats is not None else None
+        if stats:
+            st.markdown(_diag_accuracy_html(stats, "#0771eb"), unsafe_allow_html=True)
 
 
 def _render_ai_result_crosstabs(df_p2: pd.DataFrame) -> None:
