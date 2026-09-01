@@ -2747,11 +2747,122 @@ _LESION_CANON: dict[str, str] = {
 }
 
 
+def _lesion_suspicion_ipw_group_stats(g: pd.DataFrame) -> dict | None:
+    """IPW-reconstructed Lesion/Patch × Suspicion stats for a group of
+    phase-2 rows — mirrors `_ai_inference_ipw_group_stats`, but with
+    `lesion_patch` (Yes/No) standing in for the AI Result as the index
+    test being evaluated against TSD's `suspicion` (ground truth).
+
+    Phase-2's actual verification protocol does not send every case to
+    TSD, and the observed review rate differs by lesion_patch side (as
+    it correlates with the AI-driven triage). A crosstab built only from
+    reviewed rows is therefore biased. This re-weights each reviewed
+    case by the inverse of its own lesion_patch side's observed TSD
+    review rate, so a reviewed case stands in for the un-reviewed cases
+    on the same side — same derivation as the AI-vs-TSD IPW table,
+    substituting lesion_patch for the AI Result."""
+    if "lesion_patch" not in g.columns or "suspicion" not in g.columns:
+        return None
+
+    lesion_yes_m = _present_mask(g["lesion_patch"]) & _norm(g["lesion_patch"]).eq("yes")
+    lesion_no_m  = _present_mask(g["lesion_patch"]) & _norm(g["lesion_patch"]).eq("no")
+    reviewed = _phase2_reviewed_mask(g)
+    gt_susp = _norm(g["suspicion"]).eq("suspicious")
+
+    n_yes = int(lesion_yes_m.sum())
+    n_no = int(lesion_no_m.sum())
+    if n_yes + n_no == 0:
+        return None
+
+    tp_obs = int((lesion_yes_m & reviewed &  gt_susp).sum())
+    fp_obs = int((lesion_yes_m & reviewed & ~gt_susp).sum())
+    fn_obs = int((lesion_no_m  & reviewed &  gt_susp).sum())
+    tn_obs = int((lesion_no_m  & reviewed & ~gt_susp).sum())
+
+    n_yes_reviewed = tp_obs + fp_obs
+    n_no_reviewed = fn_obs + tn_obs
+
+    # weight = 1 / (observed verification rate) on each lesion_patch
+    # side. Falls back to 1 (no re-weighting) if a side has zero
+    # reviewed cases, to avoid a divide-by-zero — under-corrects
+    # rather than fabricating a rate, so treat an all-1 weight side
+    # with caution.
+    w_yes = (n_yes / n_yes_reviewed) if n_yes_reviewed else 1.0
+    w_no = (n_no / n_no_reviewed) if n_no_reviewed else 1.0
+
+    tp = tp_obs * w_yes
+    fp = fp_obs * w_yes
+    fn = fn_obs * w_no
+    tn = tn_obs * w_no
+
+    return {
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "w_yes": w_yes, "w_no": w_no,
+        "n_yes": n_yes, "n_no": n_no,
+        "n_yes_reviewed": n_yes_reviewed, "n_no_reviewed": n_no_reviewed,
+    }
+
+
+def _lesion_ipw_crosstab(stats: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Builds a _row_pct_crosstab()-shaped (counts, row-pct) pair from
+    IPW-reconstructed Lesion/Patch × Suspicion stats — rounds the
+    weighted (float) cell values for display, same layout/label
+    ordering (alphabetical) as the un-weighted `_row_pct_crosstab`
+    output so it renders through the same `_row_pct_crosstab_html`."""
+    rows = ["TSD Non Suspicious (0)", "TSD Suspicious (1)"]
+    cols = ["No (0)", "Yes (1)"]
+    ct = pd.DataFrame(
+        [[stats["tn"], stats["fp"]], [stats["fn"], stats["tp"]]],
+        index=rows, columns=cols,
+    ).round(0)
+    ct["Total"] = ct.sum(axis=1)
+    total_row = ct.sum(axis=0)
+    total_row.name = "Total"
+    ct = pd.concat([ct, total_row.to_frame().T])
+    pct = ct.div(ct["Total"], axis=0) * 100
+    return ct, pct
+
+
+def _lesion_ipw_diag_accuracy(stats: dict) -> dict:
+    """Sensitivity/Specificity/PPV/NPV/LR+/LR- computed directly from
+    IPW-reconstructed tp/fp/fn/tn — same formulas as `_diag_accuracy`,
+    just fed from the weighted stats dict instead of a crosstab
+    lookup."""
+    tp, fp, fn, tn = stats["tp"], stats["fp"], stats["fn"], stats["tn"]
+    sens = tp / (tp + fn) if (tp + fn) else float("nan")
+    spec = tn / (tn + fp) if (tn + fp) else float("nan")
+    ppv = tp / (tp + fp) if (tp + fp) else float("nan")
+    npv = tn / (tn + fn) if (tn + fn) else float("nan")
+    lr_pos = (sens / (1 - spec)) if spec < 1 else float("inf")
+    lr_neg = ((1 - sens) / spec) if spec > 0 else float("inf")
+    return {
+        "Sensitivity": sens * 100, "Specificity": spec * 100,
+        "PPV": ppv * 100, "NPV": npv * 100,
+        "LR+": lr_pos, "LR-": lr_neg,
+    }
+
+
 def _render_lesion_suspicion_crosstabs(df_all: pd.DataFrame, df_p2: pd.DataFrame) -> None:
     """Descriptive-tab addendum: Suspicion × Lesion/Patch cross-tab with
     row percentages (Stata `tab suspicion lesion_patch, row`) — overall
     on the combined dataset, then split by AI Result (Suspicious /
     Non-suspicious), phase-2 only. Three tables shown side by side.
+
+    The Overall table never mixes phase-1 and phase-2 rows, since the
+    two phases have incompatible review protocols (phase-1 reviews
+    every case; phase-2 reviews essentially all AI-suspicious cases but
+    only samples AI-non-suspicious ones):
+      - Global phase filter = Phase 2 → phase-2's partial-verification
+        protocol means a raw crosstab of reviewed rows would be biased,
+        so the Overall table is instead built via the same
+        inverse-probability weighting used by the 'IPW-Reconstructed
+        Diagnostics — AI vs TSD' table on the AI Inference tab, with
+        lesion_patch (Yes/No) standing in for the AI Result. Title:
+        "Overall (Phase 2, IPW-Reconstructed)".
+      - Global phase filter = All or Phase 1 → the table is restricted
+        to phase-1 rows only (even under "All") and shown as a plain
+        observed crosstab, since phase-1 isn't subject to phase-2's
+        partial-review protocol. Title: "Overall (Phase 1)".
 
     Sensitivity/Specificity/PPV/NPV/LR+/LR- are shown only under the
     Overall table. They're deliberately omitted from the two AI-split
@@ -2779,33 +2890,83 @@ def _render_lesion_suspicion_crosstabs(df_all: pd.DataFrame, df_p2: pd.DataFrame
         unsafe_allow_html=True,
     )
 
-    ct, pct = _row_pct_crosstab(
-        df_all, "suspicion", "lesion_patch",
-        row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
+    # Global phase filter is Phase 2 only when every surviving row in
+    # df_all is phase '2' (app.py applies the sidebar phase filter to
+    # df_all identically to df_p2, so in that case df_all *is* the
+    # phase-2 subset) — trigger the IPW-weighted table in that case.
+    is_phase2_only = (
+        "phase" in df_all.columns
+        and not df_all.empty
+        and (df_all["phase"].astype(str) == "2").all()
     )
-    if ct is None:
-        st.info("No cases with both Lesion/Patch and Suspicion completed.")
-    else:
-        st.markdown(
-            _row_pct_crosstab_html(
-                ct, pct, "Suspicion", "Lesion/Patch",
-                "📋 Overall", "#0771eb", int(ct.loc["Total", "Total"]),
-            ),
-            unsafe_allow_html=True,
-        )
-        # Sensitivity/specificity etc. are defined relative to
-        # Lesion/Patch as the index test and Suspicion as the
-        # reference standard — that mapping is independent of how
-        # the table above is displayed, so compute it off a
-        # lesion-as-row/suspicion-as-column crosstab, not off the
-        # display-oriented `ct` above.
-        ct_stats, _ = _row_pct_crosstab(
-            df_all, "lesion_patch", "suspicion",
-            row_canon=_LESION_CANON, col_canon=_SUSPICION_CANON,
-        )
-        stats = _diag_accuracy(ct_stats) if ct_stats is not None else None
-        if stats:
+
+    if is_phase2_only:
+        ipw_stats = _lesion_suspicion_ipw_group_stats(df_all)
+        if ipw_stats is None:
+            st.info("No cases with both Lesion/Patch and Suspicion completed.")
+        else:
+            ct, pct = _lesion_ipw_crosstab(ipw_stats)
+            n_total_w = int(round(ct.loc["Total", "Total"]))
+            st.markdown(
+                _row_pct_crosstab_html(
+                    ct, pct, "Suspicion", "Lesion/Patch",
+                    "📋 Overall (Phase 2, IPW-Reconstructed)", "#0771eb", n_total_w,
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div style='font-size:12.5px;color:#888;margin-top:-8px;"
+                f"margin-bottom:12px;'>"
+                f"Reconstructed via inverse-probability weighting: each reviewed "
+                f"Lesion-Yes/Lesion-No case is re-weighted by the inverse of its "
+                f"own side's observed TSD-review rate (Lesion=Yes ×"
+                f"{ipw_stats['w_yes']:.2f}, Lesion=No ×{ipw_stats['w_no']:.2f}), "
+                f"correcting for phase-2's partial verification — same method as "
+                f"the 'IPW-Reconstructed Diagnostics — AI vs TSD' table, with "
+                f"Lesion/Patch in place of the AI Result."
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            stats = _lesion_ipw_diag_accuracy(ipw_stats)
             st.markdown(_diag_accuracy_html(stats, "#0771eb"), unsafe_allow_html=True)
+    else:
+        # Restrict to phase-1 rows only — even when the global filter is
+        # "All" — since phase-1 and phase-2 use incompatible review
+        # protocols and mixing them would silently blend an unbiased
+        # (phase-1) crosstab with a biased, partially-reviewed
+        # (phase-2) one.
+        df_p1_view = (
+            df_all.loc[df_all["phase"].astype(str) == "1"]
+            if "phase" in df_all.columns
+            else df_all
+        )
+        ct, pct = _row_pct_crosstab(
+            df_p1_view, "suspicion", "lesion_patch",
+            row_canon=_SUSPICION_CANON_TSD, col_canon=_LESION_CANON,
+        )
+        if ct is None:
+            st.info("No Phase-1 cases with both Lesion/Patch and Suspicion completed.")
+        else:
+            st.markdown(
+                _row_pct_crosstab_html(
+                    ct, pct, "Suspicion", "Lesion/Patch",
+                    "📋 Overall (Phase 1)", "#0771eb", int(ct.loc["Total", "Total"]),
+                ),
+                unsafe_allow_html=True,
+            )
+            # Sensitivity/specificity etc. are defined relative to
+            # Lesion/Patch as the index test and Suspicion as the
+            # reference standard — that mapping is independent of how
+            # the table above is displayed, so compute it off a
+            # lesion-as-row/suspicion-as-column crosstab, not off the
+            # display-oriented `ct` above.
+            ct_stats, _ = _row_pct_crosstab(
+                df_p1_view, "lesion_patch", "suspicion",
+                row_canon=_LESION_CANON, col_canon=_SUSPICION_CANON,
+            )
+            stats = _diag_accuracy(ct_stats) if ct_stats is not None else None
+            if stats:
+                st.markdown(_diag_accuracy_html(stats, "#0771eb"), unsafe_allow_html=True)
 
 
 def _render_ai_result_crosstabs(df_p2: pd.DataFrame) -> None:

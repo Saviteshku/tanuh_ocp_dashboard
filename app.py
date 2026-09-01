@@ -987,6 +987,29 @@ def main() -> None:
         else pd.Series(dtype="datetime64[ns]")
     )
 
+    # Phase filter — placed with the date filter at the top of the panel.
+    # Default is "All" (no filtering); applies uniformly to df_all, df_p1,
+    # and df_p2 below, same as Gender / Study Setting.
+    _PHASE_LABELS = {
+        "1": "Phase 1 · Image-Based Screening",
+        "2": "Phase 2 · AI-Enabled Screening",
+    }
+    phase_values: list[str] = []
+    if has_phase:
+        phase_values = sorted(
+            v for v in df_raw["phase"].dropna().astype(str).unique().tolist()
+            if v.strip().lower() not in ("nan", "none", "", "-", ".")
+        )
+
+    phase_sel = "All"
+    if phase_values:
+        phase_sel = st.sidebar.selectbox(
+            "🧭 Phase",
+            ["All"] + phase_values,
+            format_func=lambda v: "All" if v == "All" else _PHASE_LABELS.get(v, v),
+            key=f"ph_{_f}",
+        )
+
     date_mask = pd.Series(True, index=df_raw.index)
     # The sidebar's actual selected Date range boundaries, passed down
     # to the Research Dashboard (see research_dashboard.render) so its
@@ -1144,6 +1167,12 @@ def main() -> None:
     else:
         df_p1 = df_all.copy()
         df_p2 = pd.DataFrame(columns=df_raw.columns)
+
+    # Phase filter
+    if phase_sel != "All" and has_phase:
+        for _df in (df_all, df_p1, df_p2):
+            if "phase" in _df.columns:
+                _df.drop(_df.index[_df["phase"].astype(str) != phase_sel], inplace=True)
 
     # Gender filter
     if gender_sel != "All" and gender_col:
