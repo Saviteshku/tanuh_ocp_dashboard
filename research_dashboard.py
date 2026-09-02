@@ -807,43 +807,6 @@ def _wrap_label(text: str, width: int = 15, max_lines: int = 4) -> str:
     return "<br>".join(lines)
 
 
-def _format_flw_hover_block(sub: pd.DataFrame, max_rows_per_col: int = 15, max_cols: int = 6) -> str:
-    """One "name: **count**" line per FLW, sorted ascending (already
-    sorted by the caller) — every FLW is listed, with no cap. The count
-    is styled bold + blue so it stands out from the FLW name. Once a
-    site has more FLWs than fit in a single column (`max_rows_per_col`),
-    the list spreads across additional side-by-side columns — 2, 3,
-    4... up to `max_cols` — so it grows wider rather than indefinitely
-    taller, though a very large site can still end up with a tall,
-    multi-column block."""
-    entries = []
-    for _, r in sub.iterrows():
-        flag = " ⚠️" if r["total"] == 0 else ""
-        value = f"<span style='color:#1565C0;font-weight:700'>{int(r['total']):,}</span>"
-        entries.append(f"{html.escape(str(r['flw_username']))}: {value}{flag}")
-
-    if len(entries) <= max_rows_per_col:
-        return "<br>".join(entries)
-
-    n_cols = min(max_cols, math.ceil(len(entries) / max_rows_per_col))
-    rows_per_col = math.ceil(len(entries) / n_cols)
-    cols = [entries[i * rows_per_col:(i + 1) * rows_per_col] for i in range(n_cols)]
-    # No padding needed after the last (rightmost) column.
-    col_widths = [max((len(e) for e in col), default=0) + 3 for col in cols[:-1]]
-
-    lines = []
-    for row_i in range(rows_per_col):
-        parts = []
-        for c, col in enumerate(cols):
-            if row_i < len(col):
-                cell = col[row_i]
-                if c < len(cols) - 1:
-                    cell = cell.ljust(col_widths[c])
-                parts.append(cell)
-        lines.append("".join(parts))
-    return "<br>".join(lines)
-
-
 def _fig_single_site_flw_detail(site: str, sub: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
     """Full-detail per-FLW case-count bar chart for a single site — used
     when the sidebar's "Site" filter has narrowed the grid down to
@@ -932,11 +895,8 @@ def _fig_single_site_flw_detail(site: str, sub: pd.DataFrame, weeks: float = 1.0
 
 def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
     """Grid of one colorful box per site — wrapped site name, active-FLW
-    count, and cases/FLW/week rate shown directly on the box (no hover
-    needed for those). Hovering a box additionally lists every FLW at
-    that site and their case count for the window, sorted ascending so
-    the lowest-recruiting (most likely underperforming) FLWs appear
-    first. Tiles are laid out in descending order of active-FLW count,
+    count, and cases/FLW/week rate shown directly on the box. Tiles are
+    laid out in descending order of active-FLW count,
     filled row by row, so the top row holds the highest-FLW sites, the
     next row the mid-range sites, and the last row the lowest.
 
@@ -989,8 +949,6 @@ def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
 
     pad = 0.06
     shapes, annotations = [], []
-    z_grid = [[np.nan] * n_cols for _ in range(n_rows)]
-    text_grid = [[""] * n_cols for _ in range(n_rows)]
 
     for idx, site in enumerate(site_order):
         row, col = divmod(idx, n_cols)
@@ -1004,15 +962,6 @@ def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
         fill = pcolors.sample_colorscale("Blues", [frac])[0]
         text_color = "#FFFFFF" if frac > 0.55 else "#222222"
         muted_text_color = "rgba(255,255,255,0.85)" if frac > 0.55 else "#555555"
-
-        header = [
-            f"<b>{html.escape(str(site))}</b>",
-            f"{n_flw} active FLW(s) · {total_cases:,} cases · {ratio_per_week:.2f} cases/FLW/week",
-            "—",
-        ]
-        hover_text = "<br>".join(header) + "<br>" + _format_flw_hover_block(sub)
-        z_grid[row][col] = 1
-        text_grid[row][col] = hover_text
 
         x0, x1 = xi - 0.5 + pad, xi + 0.5 - pad
         y0, y1 = yi - 0.5 + pad, yi + 0.5 - pad
@@ -1037,37 +986,14 @@ def _fig_site_flw_grid(stats: pd.DataFrame, weeks: float = 1.0) -> go.Figure:
         ))
 
     fig = go.Figure()
-    # A heatmap trace (fully transparent) instead of fixed-pixel-size
-    # scatter markers — its hit area exactly matches each cell's data-space
-    # bounding box, so hover fires reliably across the whole tile
-    # regardless of container width, rather than only inside a fixed-size
-    # marker that may not fully cover a tile at some screen widths.
-    #
-    # One phantom coordinate is appended past the last column and past
-    # the last row (z/text = NaN/"" so it's never drawn). Plotly derives
-    # each cell's hover hit-area from the gap between consecutive x/y
-    # coordinates; with only a single column and/or single row there's
-    # no second coordinate to measure a gap against, and that axis's
-    # hit-area can collapse to zero width. The phantom point sits just
-    # outside the visible axis range set below, so it's never itself
-    # seen or hoverable — it only gives the gap calculation something
-    # to work with. (The n_sites == 1 case is now handled by the bar
-    # chart above and never reaches this code path, but the padding is
-    # kept here too since a 1-row or 1-column *multi-site* grid, e.g. 2
-    # or 3 sites total, is still possible.)
-    x_coords = list(range(n_cols)) + [n_cols]
-    y_coords = list(range(n_rows)) + [n_rows]
-    z_grid = [row + [np.nan] for row in z_grid] + [[np.nan] * (n_cols + 1)]
-    text_grid = [row + [""] for row in text_grid] + [[""] * (n_cols + 1)]
-    fig.add_trace(go.Heatmap(
-        z=z_grid, x=x_coords, y=y_coords,
-        text=text_grid, hovertemplate="%{text}<extra></extra>",
-        colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0)"]],
-        zmin=0, zmax=1, showscale=False,
-        hoverlabel=dict(
-            align="left", bgcolor="white",
-            font=dict(size=12, family="Courier New, monospace"),
-        ),
+    # Invisible marker trace with no hover — the grid itself is drawn via
+    # shapes/annotations below, but `_render_leaderboard` checks
+    # `fig_site_grid.data` to decide whether to render the chart, so we
+    # need at least one (non-interactive) trace present.
+    fig.add_trace(go.Scatter(
+        x=[0], y=[0], mode="markers",
+        marker=dict(size=0.1, color="rgba(0,0,0,0)"),
+        hoverinfo="skip", showlegend=False,
     ))
     fig.update_layout(
         height=max(210 * n_rows + 30, 130 + 16 * min(max_flw_at_a_site, 30)),
@@ -1209,24 +1135,19 @@ def _render_leaderboard(
         st.markdown(
             "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:4px;"
             "min-height:40px;'>"
-            f"🧑‍🤝‍🧑 FLWs by site{site_suffix} ({total_flws} FLWs total) "
-            "<span style='font-size:11px;font-weight:500;color:#888;font-style:italic;'>"
-            "(hover a box for per-FLW case counts, lowest first)</span></div>"
+            f"🧑‍🤝‍🧑 FLWs by site{site_suffix} ({total_flws} FLWs total)</div>"
             "<div style='margin-bottom:-10px;'></div>",
             unsafe_allow_html=True,
         )
         fig_site_grid = _fig_site_flw_grid(site_stats, counts_weeks)
         if fig_site_grid.data:
             # Key includes the grid's shape (rows/cols/site set) rather than
-            # a fixed string. This chart is a Heatmap whose grid dimensions,
-            # axis ranges, and per-cell hover text all change size when a
-            # global filter (site/date/gender) narrows the site list.
-            # Streamlit reuses the existing Plotly div and does an in-place
-            # Plotly.react() update when the key is unchanged — for a
-            # Heatmap that changed shape, the hover hit-testing can end up
-            # stale/dead after that in-place update. Varying the key with
-            # the data forces Streamlit to fully remount the component on
-            # a filter change instead, so hover keeps working.
+            # a fixed string. This chart's grid dimensions and axis ranges
+            # change size when a global filter (site/date/gender) narrows
+            # the site list. Streamlit reuses the existing Plotly div and
+            # does an in-place Plotly.react() update when the key is
+            # unchanged — varying the key with the data forces Streamlit to
+            # fully remount the component on a filter change instead.
             grid_sites = tuple(sorted(site_stats["site_full_id"].astype(str).unique()))
             grid_key = "lb_site_flw_grid_" + hashlib.md5(
                 "|".join(grid_sites).encode("utf-8")
@@ -2053,7 +1974,7 @@ def _render_ai_inference(df_p2: pd.DataFrame) -> None:
     st.markdown("<div style='margin-top:22px;'></div>", unsafe_allow_html=True)
     st.markdown(
         "<div style='font-weight:700;font-size:15px;color:#333;margin-bottom:10px;'>"
-        "📊 Prior-Data Triage Projection — Expected AI/TSD Split by Site</div>",
+        "📊 Expected AI/TSD Split by Site (Phase 1 Data)</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
